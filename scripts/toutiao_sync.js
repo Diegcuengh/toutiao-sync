@@ -44,7 +44,10 @@ function parseArgs() {
   if (jobIndex === -1 || !args[jobIndex + 1]) {
     throw new Error("缺少 --job 参数");
   }
-  return { jobPath: path.resolve(args[jobIndex + 1]) };
+  return {
+    jobPath: path.resolve(args[jobIndex + 1]),
+    checkLogin: args.includes("--login-status"),
+  };
 }
 
 function normalizeJobConfig(rawJob) {
@@ -114,6 +117,10 @@ function writeTextFile(filePath, content) {
 
 function hashText(input) {
   return crypto.createHash("sha1").update(input).digest("hex");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function probeChromeDebugger() {
@@ -227,6 +234,100 @@ async function findToutiaoPage(browser) {
   const page = await context.newPage();
   await page.goto("https://www.toutiao.com/", { waitUntil: "domcontentloaded" });
   return page;
+}
+
+async function detectLoginState(page) {
+  return page.evaluate(() => {
+    const url = location.href;
+    const title = document.title || "";
+    const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ");
+    const anchors = Array.from(document.querySelectorAll("a[href]")).map((anchor) => ({
+      href: anchor.href || "",
+      text: (anchor.textContent || anchor.getAttribute("title") || "").replace(/\s+/g, " ").trim(),
+    }));
+    const hasProfileEntry = anchors.some((item) => item.href.includes("/c/user/token/"));
+    const hasSourceEntry = anchors.some((item) => (
+      item.href.includes("/c/user/token/") &&
+      (item.text.includes("我的收藏") || item.href.includes("tab=fav") || item.href.includes("source=mine_profile"))
+    ));
+    const visibleLoginButtons = Array.from(document.querySelectorAll("a, button, [role='button'], div, span"))
+      .map((element) => {
+        const text = (element.textContent || "").replace(/\s+/g, " ").trim();
+        const rect = element.getBoundingClientRect();
+        return { text, top: rect.top, width: rect.width, height: rect.height };
+      })
+      .filter((item) => item.top >= 0 && item.top < 260 && item.width > 0 && item.height > 0)
+      .some((item) => ["登录", "立即登录"].includes(item.text) || item.text.includes("请登录"));
+    const loginUrl = /login|passport|sso/i.test(url);
+    const loginText = /请登录|立即登录|手机号登录|验证码登录|扫码登录/.test(bodyText);
+    const loginRequired = loginUrl || visibleLoginButtons || loginText;
+
+    return {
+      url,
+      title,
+      isLoggedIn: !loginRequired && (hasSourceEntry || hasProfileEntry),
+      loginRequired,
+      hasProfileEntry,
+      hasSourceEntry,
+      bodyPreview: bodyText.slice(0, 180),
+    };
+  });
+}
+
+async function ensureLoggedIn(page, source) {
+  let loginState = await detectLoginState(page);
+  if (loginState.isLoggedIn && !loginState.loginRequired) {
+    return loginState;
+  }
+
+  emitProgress("未检测到今日头条登录状态，已打开登录页；请在 Chrome 完成登录，程序会自动继续", {
+    pageUrl: loginState.url,
+    pageTitle: loginState.title,
+  });
+
+  if (!page.url().includes("toutiao.com") || /login|passport|sso/i.test(page.url())) {
+    await page.goto("https://www.toutiao.com/", { waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
+  }
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < 180000) {
+    await sleep(2500);
+    loginState = await detectLoginState(page);
+    if (loginState.isLoggedIn && !loginState.loginRequired) {
+      emitProgress(`已检测到登录，继续跳转到${source === "likes" ? "喜欢" : "收藏"}列表`, {
+        pageUrl: loginState.url,
+        pageTitle: loginState.title,
+      });
+      return loginState;
+    }
+  }
+
+  throw new Error("未登录：请在调试 Chrome 中完成今日头条登录后重试。登录完成后程序会自动进入收藏/喜欢列表。");
+}
+
+async function emitLoginStatus(page, source) {
+  if (!page.url().includes("toutiao.com")) {
+    await page.goto("https://www.toutiao.com/", { waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
+  }
+  await page.waitForTimeout(1800);
+  let loginState = await detectLoginState(page);
+  if (!loginState.isLoggedIn && !loginState.url.includes("toutiao.com")) {
+    await page.goto("https://www.toutiao.com/", { waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
+    await page.waitForTimeout(1800);
+    loginState = await detectLoginState(page);
+  }
+  const loggedIn = loginState.isLoggedIn && !loginState.loginRequired;
+  emit({
+    type: "login_status",
+    loggedIn,
+    loginRequired: !loggedIn,
+    source,
+    message: loggedIn
+      ? "已登录今日头条，可以同步"
+      : "未登录：请在 Chrome 中登录今日头条，登录后点击“检查登录”",
+    pageUrl: loginState.url,
+    pageTitle: loginState.title,
+  });
 }
 
 async function inspectCurrentPage(page, source) {
@@ -665,7 +766,7 @@ async function collectDetail(page, job, item) {
 }
 
 async function main() {
-  const { jobPath } = parseArgs();
+  const { jobPath, checkLogin } = parseArgs();
   const job = normalizeJobConfig(JSON.parse(fs.readFileSync(jobPath, "utf8")));
   const mode = String(job.mode || "incremental");
   const isVerifyMode = mode.startsWith("verify");
@@ -685,6 +786,12 @@ async function main() {
   emitProgress("连接 Chrome");
   const browser = await connectChrome(job);
   const page = await findToutiaoPage(browser);
+  if (checkLogin) {
+    await emitLoginStatus(page, job.source);
+    await browser.close();
+    return;
+  }
+  await ensureLoggedIn(page, job.source);
 
   let pageInfo = await inspectCurrentPage(page, job.source);
   if (!isOnTargetList(pageInfo, job.source)) {
@@ -711,6 +818,12 @@ async function main() {
     );
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
     await page.waitForTimeout(2500);
+    const loginState = await detectLoginState(page);
+    if (loginState.loginRequired && !loginState.isLoggedIn) {
+      await ensureLoggedIn(page, job.source);
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
+      await page.waitForTimeout(2500);
+    }
     pageInfo = await inspectCurrentPage(page, job.source);
   }
   assertPageLooksRight(pageInfo, job.source);

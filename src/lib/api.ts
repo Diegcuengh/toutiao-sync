@@ -1,5 +1,5 @@
 ﻿import { invoke } from "@tauri-apps/api/core";
-import type { AppBootstrap, ContentItem, DiagnosePageRequest, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest } from "../types";
+import type { AppBootstrap, ContentItem, DiagnosePageRequest, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest } from "../types";
 
 function hasTauriRuntime() {
   if (typeof window === "undefined") {
@@ -49,6 +49,10 @@ export async function launchDebugChrome(): Promise<void> {
 
 export async function diagnosePage(request: DiagnosePageRequest): Promise<PageDiagnosis> {
   return safeInvoke("diagnose_page", { request });
+}
+
+export async function checkToutiaoLogin(request: DiagnosePageRequest): Promise<LoginStatus> {
+  return safeInvoke("check_toutiao_login", { request });
 }
 
 export async function listSessions(): Promise<SyncSession[]> {

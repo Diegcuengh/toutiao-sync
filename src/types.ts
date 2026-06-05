@@ -55,6 +55,15 @@ export interface PageDiagnosis {
   logs: string[];
 }
 
+export interface LoginStatus {
+  loggedIn: boolean;
+  loginRequired: boolean;
+  source: SyncSource;
+  message: string;
+  pageUrl?: string | null;
+  pageTitle?: string | null;
+}
+
 export interface ContentItem {
   id: number;
   remoteId: string;

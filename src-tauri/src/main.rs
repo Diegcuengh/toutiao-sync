@@ -90,6 +90,7 @@ fn main() {
             commands::choose_data_directory,
             commands::migrate_data_directory,
             commands::launch_debug_chrome,
+            commands::check_toutiao_login,
             commands::diagnose_page,
             commands::start_sync,
             commands::list_sync_sessions,

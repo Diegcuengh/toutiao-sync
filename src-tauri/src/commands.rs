@@ -9,7 +9,7 @@ use crate::{
     build_info,
     db,
     error::AppError,
-    models::{AppBootstrap, ContentItem, DiagnosePageRequest, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest},
+    models::{AppBootstrap, ContentItem, DiagnosePageRequest, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest},
     sync,
 };
 
@@ -140,6 +140,15 @@ pub fn diagnose_page(
 ) -> Result<PageDiagnosis, AppError> {
     log_command("diagnose_page");
     sync::diagnose_page(state.inner(), &request.source)
+}
+
+#[tauri::command]
+pub fn check_toutiao_login(
+    state: State<'_, AppState>,
+    request: DiagnosePageRequest,
+) -> Result<LoginStatus, AppError> {
+    log_command("check_toutiao_login");
+    sync::check_login_status(state.inner(), &request.source)
 }
 
 #[tauri::command]

@@ -39,6 +39,17 @@ pub struct PageDiagnosis {
     pub logs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginStatus {
+    pub logged_in: bool,
+    pub login_required: bool,
+    pub source: String,
+    pub message: String,
+    pub page_url: Option<String>,
+    pub page_title: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncSession {

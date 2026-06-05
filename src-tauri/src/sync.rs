@@ -11,7 +11,7 @@ use crate::{
     app_state::AppState,
     db,
     error::AppError,
-    models::{PageDiagnosis, ScriptEvent, SyncSession},
+    models::{LoginStatus, PageDiagnosis, ScriptEvent, SyncSession},
 };
 
 #[derive(serde::Serialize)]
@@ -101,6 +101,32 @@ pub fn diagnose_page(state: &AppState, source: &str) -> Result<PageDiagnosis, Ap
     fs::write(&job_path, serde_json::to_vec_pretty(&job)?)?;
 
     let result = run_diagnose_script(state, source, &job_path);
+    let _ = fs::remove_file(&job_path);
+    result
+}
+
+pub fn check_login_status(state: &AppState, source: &str) -> Result<LoginStatus, AppError> {
+    let jobs_dir = state.jobs_dir()?;
+    let data_dir = state.data_dir()?;
+    let download_dir = state.download_dir()?;
+    let chrome_user_data_dir = state.chrome_user_data_dir()?;
+
+    let job_path = jobs_dir.join(format!("login-status-{}.json", source));
+    AppState::ensure_parent(&job_path)?;
+    let job = ScriptJob {
+        session_id: "login-status",
+        source,
+        mode: "login-status",
+        max_items: None,
+        data_dir: data_dir.display().to_string(),
+        download_dir: download_dir.display().to_string(),
+        chrome_user_data_dir: chrome_user_data_dir.display().to_string(),
+        cdp_port: state.chrome_cdp_port,
+        known_remote_ids: Vec::new(),
+    };
+    fs::write(&job_path, serde_json::to_vec_pretty(&job)?)?;
+
+    let result = run_login_status_script(state, source, &job_path);
     let _ = fs::remove_file(&job_path);
     result
 }
@@ -278,6 +304,60 @@ async fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> R
         )));
     }
     Ok(())
+}
+
+fn run_login_status_script(state: &AppState, source: &str, job_path: &Path) -> Result<LoginStatus, AppError> {
+    let script_path = state.script_path.clone();
+    if !script_path.exists() {
+        return Err(AppError::Message(format!(
+            "同步脚本不存在: {}",
+            script_path.display()
+        )));
+    }
+
+    let working_dir = resolve_script_working_dir(&script_path)?;
+    let mut child = Command::new(&state.node_bin)
+        .current_dir(working_dir)
+        .arg(&script_path)
+        .arg("--login-status")
+        .arg("--job")
+        .arg(job_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::Message("无法读取登录检查脚本输出".into()))?;
+
+    let reader = BufReader::new(stdout);
+    let mut login_status = None;
+
+    for line_result in reader.lines() {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(&line)?;
+        if value.get("type").and_then(|item| item.as_str()) == Some("login_status") {
+            login_status = Some(serde_json::from_value::<LoginStatus>(value)?);
+        }
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(AppError::Message(format!(
+            "登录检查脚本退出码异常: {:?}",
+            status.code()
+        )));
+    }
+
+    login_status.ok_or_else(|| {
+        AppError::Message(format!(
+            "未读取到登录状态，请确认 Chrome 调试端口可用并打开今日头条。来源: {source}"
+        ))
+    })
 }
 
 fn run_diagnose_script(state: &AppState, source: &str, job_path: &Path) -> Result<PageDiagnosis, AppError> {
