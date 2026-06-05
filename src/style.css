@@ -1,0 +1,186 @@
+:root {
+  color-scheme: dark;
+  font-family: "Microsoft YaHei", system-ui, sans-serif;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: linear-gradient(180deg, #0f172a, #111827);
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 16px;
+  cursor: pointer;
+  background: #2563eb;
+  color: white;
+}
+
+button.secondary {
+  background: #1f2937;
+  border: 1px solid #334155;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+input,
+select {
+  border: 1px solid #334155;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+a {
+  color: #60a5fa;
+  text-decoration: none;
+}
+
+.layout {
+  padding: 24px;
+  display: grid;
+  gap: 20px;
+}
+
+.split {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: 20px;
+}
+
+.panel {
+  background: rgba(15, 23, 42, 0.82);
+  border: 1px solid #1e293b;
+  border-radius: 18px;
+  padding: 20px;
+  backdrop-filter: blur(8px);
+}
+
+.hero {
+  display: grid;
+  gap: 16px;
+}
+
+.hero h1,
+.section-head h2,
+.card h3 {
+  margin: 0;
+}
+
+.hint,
+.message,
+.card p {
+  color: #94a3b8;
+}
+
+.hero-actions,
+.search-bar,
+.card-actions,
+.card-meta,
+.card-head,
+.section-head {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.section-head {
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.meta-grid {
+  display: grid;
+  gap: 6px;
+  color: #93c5fd;
+}
+
+.latest {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 12px;
+  color: #cbd5e1;
+}
+
+.error {
+  color: #fca5a5;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.table th,
+.table td {
+  border-bottom: 1px solid #1e293b;
+  padding: 10px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.table tbody tr {
+  cursor: pointer;
+}
+
+.table tbody tr.selected {
+  background: rgba(37, 99, 235, 0.14);
+}
+
+.cards {
+  display: grid;
+  gap: 12px;
+  max-height: 70vh;
+  overflow: auto;
+}
+
+.log-list {
+  max-height: 420px;
+}
+
+.log-card {
+  gap: 8px;
+}
+
+.badge.danger {
+  background: #b91c1c;
+}
+
+.card {
+  border: 1px solid #1e293b;
+  border-radius: 14px;
+  padding: 14px;
+  background: #0b1220;
+  display: grid;
+  gap: 10px;
+}
+
+.badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #1d4ed8;
+}
+
+@media (max-width: 1100px) {
+  .split {
+    grid-template-columns: 1fr;
+  }
+}

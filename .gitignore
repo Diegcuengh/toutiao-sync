@@ -1,0 +1,6 @@
+node_modules
+dist
+.tmp-diagnose
+/vite1421.err
+/vite1421.out
+/vite14321.log
