@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
     error::AppError,
-    models::{ContentItem, ScriptItem, SyncEvent, SyncSession},
+    models::{ContentItem, ScriptItem, SyncEvent, SyncSession, UserProfile},
 };
 
 pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
@@ -55,6 +55,17 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
           UNIQUE(source, remote_id)
         );
 
+        CREATE TABLE IF NOT EXISTS user_profile (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          name TEXT NOT NULL DEFAULT '',
+          avatar_url TEXT,
+          likes TEXT NOT NULL DEFAULT '',
+          followers TEXT NOT NULL DEFAULT '',
+          following TEXT NOT NULL DEFAULT '',
+          bio TEXT NOT NULL DEFAULT '',
+          updated_at TEXT NOT NULL DEFAULT ''
+        );
+
         CREATE INDEX IF NOT EXISTS idx_content_items_title ON content_items(title);
         CREATE INDEX IF NOT EXISTS idx_content_items_synced_at ON content_items(synced_at DESC);
         CREATE INDEX IF NOT EXISTS idx_sync_events_session_id ON sync_events(session_id);
@@ -66,6 +77,57 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
     ensure_column(&conn, "content_items", "content_text", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(&conn, "content_items", "cover_path", "TEXT")?;
     Ok(conn)
+}
+
+pub fn upsert_user_profile(conn: &Connection, profile: &UserProfile) -> Result<(), AppError> {
+    conn.execute(
+        r#"
+        INSERT INTO user_profile (id, name, avatar_url, likes, followers, following, bio, updated_at)
+        VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(id) DO UPDATE SET
+          name = excluded.name,
+          avatar_url = excluded.avatar_url,
+          likes = excluded.likes,
+          followers = excluded.followers,
+          following = excluded.following,
+          bio = excluded.bio,
+          updated_at = excluded.updated_at
+        "#,
+        params![
+            profile.name,
+            profile.avatar_url,
+            profile.likes,
+            profile.followers,
+            profile.following,
+            profile.bio,
+            profile.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_user_profile(conn: &Connection) -> Result<Option<UserProfile>, AppError> {
+    conn.query_row(
+        r#"
+        SELECT name, avatar_url, likes, followers, following, bio, updated_at
+        FROM user_profile
+        WHERE id = 1
+        "#,
+        [],
+        |row| {
+            Ok(UserProfile {
+                name: row.get(0)?,
+                avatar_url: row.get(1)?,
+                likes: row.get(2)?,
+                followers: row.get(3)?,
+                following: row.get(4)?,
+                bio: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(AppError::from)
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<(), AppError> {
@@ -117,6 +179,39 @@ pub fn list_sessions(conn: &Connection) -> Result<Vec<SyncSession>, AppError> {
         sessions.push(row?);
     }
     Ok(sessions)
+}
+
+pub fn reset_running_sessions(conn: &Connection, message: &str, finished_at: &str) -> Result<(), AppError> {
+    conn.execute(
+        r#"
+        UPDATE sync_sessions
+        SET status = 'stopped',
+            message = ?1,
+            finished_at = ?2
+        WHERE status = 'running'
+        "#,
+        params![message, finished_at],
+    )?;
+    Ok(())
+}
+
+pub fn list_remote_ids_requiring_download(conn: &Connection, source: &str) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT remote_id
+        FROM content_items
+        WHERE source = ?1
+          AND article_path IS NULL
+          AND video_path IS NULL
+        ORDER BY synced_at DESC
+        "#,
+    )?;
+    let rows = stmt.query_map([source], |row| row.get::<_, String>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    Ok(ids)
 }
 
 pub fn list_sync_events(conn: &Connection, session_id: Option<&str>) -> Result<Vec<SyncEvent>, AppError> {
@@ -238,15 +333,15 @@ pub fn upsert_item(conn: &Connection, source: &str, item: &ScriptItem, synced_at
         ON CONFLICT(source, remote_id) DO UPDATE SET
           title = excluded.title,
           summary = excluded.summary,
-          content_text = excluded.content_text,
-          author = excluded.author,
+          content_text = CASE WHEN excluded.content_text = '' THEN content_items.content_text ELSE excluded.content_text END,
+          author = CASE WHEN excluded.author = '' THEN content_items.author ELSE excluded.author END,
           content_type = excluded.content_type,
           source_url = excluded.source_url,
-          cover_url = excluded.cover_url,
-          cover_path = excluded.cover_path,
-          article_path = excluded.article_path,
-          video_path = excluded.video_path,
-          local_dir = excluded.local_dir,
+          cover_url = COALESCE(excluded.cover_url, content_items.cover_url),
+          cover_path = COALESCE(excluded.cover_path, content_items.cover_path),
+          article_path = COALESCE(excluded.article_path, content_items.article_path),
+          video_path = COALESCE(excluded.video_path, content_items.video_path),
+          local_dir = COALESCE(excluded.local_dir, content_items.local_dir),
           raw_json = excluded.raw_json,
           synced_at = excluded.synced_at
         "#,
@@ -280,7 +375,7 @@ pub fn search_items(
     let keyword = format!("%{}%", query.trim());
     let mut sql = String::from(
         r#"
-        SELECT id, remote_id, source, title, summary, content_text, author, content_type, source_url, cover_url, cover_path, article_path, video_path, local_dir, synced_at,
+        SELECT id, remote_id, source, title, summary, content_text, author, content_type, source_url, cover_url, cover_path, article_path, video_path, local_dir, synced_at, raw_json,
                CASE WHEN article_path IS NOT NULL OR video_path IS NOT NULL THEN 1 ELSE 0 END AS downloaded
         FROM content_items
         WHERE 1 = 1
@@ -327,7 +422,8 @@ pub fn search_items(
             video_path: row.get(12)?,
             local_dir: row.get(13)?,
             synced_at: row.get(14)?,
-            downloaded: row.get::<_, i64>(15)? == 1,
+            raw_json: row.get(15)?,
+            downloaded: row.get::<_, i64>(16)? == 1,
         })
     })?;
 

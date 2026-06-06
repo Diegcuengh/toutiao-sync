@@ -592,17 +592,59 @@ async function collectList(page) {
         anchor.closest("[class*='card']") ||
         anchor.parentElement;
       const summary = container?.textContent?.trim()?.slice(0, 220) || "";
+      const coverNode = container?.querySelector?.("img, video[poster]");
+      const coverUrl =
+        coverNode?.getAttribute?.("poster") ||
+        coverNode?.currentSrc ||
+        coverNode?.getAttribute?.("src") ||
+        "";
       items.push({
         remoteId: url.split("/").filter(Boolean).pop() || url,
         title,
         summary,
         sourceUrl: url,
+        contentType: url.includes("/video/") ? "video" : "article",
+        coverUrl,
+        listHtml: container?.outerHTML || anchor.outerHTML || "",
       });
     }
     return Array.from(new Map(items.map((item) => [item.sourceUrl, item])).values());
   });
 
   return results;
+}
+
+async function collectProfile(page) {
+  return page.evaluate(() => {
+    const text = (selector) => document.querySelector(selector)?.textContent?.replace(/\s+/g, " ").trim() || "";
+    const bodyText = document.body?.innerText || "";
+    const avatar =
+      document.querySelector("img[src*='avatar']") ||
+      Array.from(document.querySelectorAll("img")).find((img) => {
+        const rect = img.getBoundingClientRect();
+        return rect.width >= 80 && rect.height >= 80 && rect.top < 320;
+      });
+    const name =
+      text("[class*='name']") ||
+      Array.from(document.querySelectorAll("h1, h2, strong, span"))
+        .map((node) => node.textContent?.trim() || "")
+        .find((value) => value && value.length <= 12 && !/^\d/.test(value)) ||
+      "";
+    const readMetric = (label) => {
+      const match = bodyText.match(new RegExp(`([\\d.万]+)\\s*${label}`));
+      return match?.[1] || "";
+    };
+    const bioMatch = bodyText.match(/简介[:：]\s*([^\n\r]+)/);
+    return {
+      name,
+      avatarUrl: avatar?.currentSrc || avatar?.getAttribute?.("src") || null,
+      likes: readMetric("获赞"),
+      followers: readMetric("粉丝"),
+      following: readMetric("关注"),
+      bio: bioMatch?.[1]?.replace(/\s*更多信息.*/, "").trim() || "",
+      updatedAt: new Date().toISOString(),
+    };
+  });
 }
 
 function buildNoResultError(info, source) {
@@ -628,6 +670,38 @@ function filterIncrementalCandidates(list, knownRemoteIds) {
     const legacyId = hashText(canonicalId);
     return !knownSet.has(canonicalId) && !knownSet.has(legacyId);
   });
+}
+
+function filterDownloadCandidates(list, targetRemoteIds) {
+  const targetSet = new Set((targetRemoteIds || []).map((item) => String(item)));
+  if (!targetSet.size) {
+    return [];
+  }
+  return list.filter((item) => targetSet.has(canonicalRemoteId(item)) || targetSet.has(hashText(canonicalRemoteId(item))));
+}
+
+function listItemToScriptItem(job, item) {
+  const coverUrl = resolveAssetUrl(item.coverUrl, item.sourceUrl);
+  return {
+    remote_id: canonicalRemoteId(item),
+    title: item.title,
+    summary: textToSummary(item.summary),
+    content_text: "",
+    author: "",
+    content_type: item.contentType || (item.sourceUrl.includes("/video/") ? "video" : "article"),
+    source_url: item.sourceUrl,
+    cover_url: coverUrl || null,
+    cover_path: null,
+    article_path: null,
+    video_path: null,
+    local_dir: null,
+    downloaded: false,
+    raw: {
+      list: item,
+      listOnly: true,
+      source: job.source,
+    },
+  };
 }
 
 async function downloadToFile(url, filePath) {
@@ -770,6 +844,8 @@ async function main() {
   const job = normalizeJobConfig(JSON.parse(fs.readFileSync(jobPath, "utf8")));
   const mode = String(job.mode || "incremental");
   const isVerifyMode = mode.startsWith("verify");
+  const isListMode = mode === "list";
+  const isDownloadMode = mode === "download";
   const verifyLimit = Math.max(1, Number(job.maxItems || mode.split(":")[1] || 3) || 3);
   ensureDir(job.downloadDir);
   await loadDeps();
@@ -828,6 +904,11 @@ async function main() {
   }
   assertPageLooksRight(pageInfo, job.source);
 
+  const profile = await collectProfile(page);
+  if (profile.name || profile.avatarUrl) {
+    emit({ type: "profile", profile });
+  }
+
   emitProgress(`扫描当前今日头条${job.source === "likes" ? "喜欢" : "收藏"}页面`);
   const list = await collectList(page);
   if (!list.length) {
@@ -849,10 +930,12 @@ async function main() {
     return;
   }
 
-  const candidates = filterIncrementalCandidates(list, job.knownRemoteIds);
+  const candidates = isDownloadMode
+    ? filterDownloadCandidates(list, job.knownRemoteIds)
+    : filterIncrementalCandidates(list, job.knownRemoteIds);
   const skipped = list.length - candidates.length;
   const selectedCandidates = isVerifyMode ? candidates.slice(0, verifyLimit) : candidates;
-  emitProgress(`识别到 ${list.length} 条候选内容，跳过 ${skipped} 条，新增 ${candidates.length} 条`, {
+  emitProgress(`${isDownloadMode ? "待下载" : "识别到"} ${list.length} 条候选内容，跳过 ${skipped} 条，${isDownloadMode ? "待下载" : "新增"} ${candidates.length} 条`, {
     candidates: list.length,
     skipped,
     discovered: selectedCandidates.length,
@@ -864,6 +947,20 @@ async function main() {
 
   if (!selectedCandidates.length) {
     emit({ type: "done", summary: { candidates: list.length, skipped, discovered: 0, saved: 0, downloaded: 0 } });
+    await browser.close();
+    return;
+  }
+
+  if (isListMode) {
+    let saved = 0;
+    for (const item of selectedCandidates) {
+      saved += 1;
+      emit({ type: "item", item: listItemToScriptItem(job, item) });
+    }
+    emit({
+      type: "done",
+      summary: { candidates: list.length, skipped, discovered: selectedCandidates.length, saved, downloaded: 0 },
+    });
     await browser.close();
     return;
   }
@@ -888,7 +985,7 @@ async function main() {
   try {
     for (let index = 0; index < selectedCandidates.length; index += 1) {
       const item = selectedCandidates[index];
-      emitProgress(`抓取 ${index + 1}/${selectedCandidates.length}: ${item.title}`, {
+      emitProgress(`${isDownloadMode ? "下载内容" : "抓取"} ${index + 1}/${selectedCandidates.length}: ${item.title}`, {
         candidates: list.length,
         skipped,
         discovered: selectedCandidates.length,

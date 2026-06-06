@@ -38,7 +38,7 @@ export interface SyncEvent {
 
 export interface SyncStartRequest {
   source: SyncSource;
-  mode: "incremental" | "verify";
+  mode: "list" | "download" | "incremental" | "verify";
   maxItems?: number;
 }
 
@@ -81,4 +81,15 @@ export interface ContentItem {
   localDir?: string | null;
   syncedAt: string;
   downloaded: boolean;
+  rawJson: string;
+}
+
+export interface UserProfile {
+  name: string;
+  avatarUrl?: string | null;
+  likes: string;
+  followers: string;
+  following: string;
+  bio: string;
+  updatedAt: string;
 }

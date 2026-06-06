@@ -9,7 +9,7 @@ use crate::{
     build_info,
     db,
     error::AppError,
-    models::{AppBootstrap, ContentItem, DiagnosePageRequest, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest},
+    models::{AppBootstrap, ContentItem, DiagnosePageRequest, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest, UserProfile},
     sync,
 };
 
@@ -134,6 +134,13 @@ pub fn search_items(
 }
 
 #[tauri::command]
+pub fn get_user_profile(state: State<'_, AppState>) -> Result<Option<UserProfile>, AppError> {
+    log_command("get_user_profile");
+    let conn = db::connect(&state.db_path()?)?;
+    db::get_user_profile(&conn)
+}
+
+#[tauri::command]
 pub fn diagnose_page(
     state: State<'_, AppState>,
     request: DiagnosePageRequest,
@@ -180,13 +187,14 @@ pub fn start_sync(state: State<'_, AppState>, request: SyncStartRequest) -> Resu
     } else {
         request.mode.clone()
     };
-    let initial_message = if request.mode == "verify" {
-        format!(
+    let initial_message = match request.mode.as_str() {
+        "verify" => format!(
             "等待同步脚本连接当前 Chrome（验证模式，最多抓取 {} 条）",
             request.max_items.unwrap_or(3).max(1)
-        )
-    } else {
-        "等待同步脚本连接当前 Chrome".to_string()
+        ),
+        "list" => "等待同步脚本连接当前 Chrome（仅同步列表）".to_string(),
+        "download" => "等待同步脚本连接当前 Chrome（下载未下载内容）".to_string(),
+        _ => "等待同步脚本连接当前 Chrome".to_string(),
     };
     let session = SyncSession {
         id: Uuid::new_v4().to_string(),
@@ -208,6 +216,50 @@ pub fn start_sync(state: State<'_, AppState>, request: SyncStartRequest) -> Resu
     state.mark_running(&session.id)?;
     sync::spawn_sync(state.inner().clone(), session.clone())?;
     Ok(session)
+}
+
+#[tauri::command]
+pub fn stop_sync(state: State<'_, AppState>, session_id: String) -> Result<(), AppError> {
+    log_command("stop_sync");
+    if let Some(process_id) = state.process_id(&session_id) {
+        let status = Command::new("taskkill.exe")
+            .arg("/PID")
+            .arg(process_id.to_string())
+            .arg("/T")
+            .arg("/F")
+            .status()?;
+        if !status.success() {
+            return Err(AppError::Message(format!(
+                "停止同步进程失败: PID {}，退出码 {:?}",
+                process_id,
+                status.code()
+            )));
+        }
+    }
+
+    let conn = db::connect(&state.db_path()?)?;
+    let Some(session) = db::list_sessions(&conn)?
+        .into_iter()
+        .find(|item| item.id == session_id) else {
+        state.mark_finished(&session_id);
+        return Ok(());
+    };
+    let finished_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    db::update_session_progress(
+        &conn,
+        &session_id,
+        session.total_candidates,
+        session.total_skipped,
+        session.total_discovered,
+        session.total_saved,
+        session.total_downloaded,
+        "stopped",
+        "用户已停止同步",
+        Some(&finished_at),
+    )?;
+    db::insert_sync_event(&conn, &session_id, "info", "用户已停止同步")?;
+    state.mark_finished(&session_id);
+    Ok(())
 }
 
 #[tauri::command]

@@ -1,5 +1,5 @@
 ﻿import { invoke } from "@tauri-apps/api/core";
-import type { AppBootstrap, ContentItem, DiagnosePageRequest, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest } from "../types";
+import type { AppBootstrap, ContentItem, DiagnosePageRequest, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest, UserProfile } from "../types";
 
 function hasTauriRuntime() {
   if (typeof window === "undefined") {
@@ -43,6 +43,10 @@ export async function startSync(request: SyncStartRequest): Promise<SyncSession>
   return safeInvoke("start_sync", { request });
 }
 
+export async function stopSync(sessionId: string): Promise<void> {
+  return safeInvoke("stop_sync", { sessionId });
+}
+
 export async function launchDebugChrome(): Promise<void> {
   return safeInvoke("launch_debug_chrome");
 }
@@ -82,6 +86,13 @@ export async function searchItemsWithType(
     return [];
   }
   return safeInvoke("search_items", { query, source, contentType });
+}
+
+export async function getUserProfile(): Promise<UserProfile | null> {
+  if (!hasTauriRuntime()) {
+    return null;
+  }
+  return safeInvoke("get_user_profile");
 }
 
 export async function openDownloadDir(): Promise<void> {

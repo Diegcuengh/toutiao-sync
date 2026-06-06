@@ -38,7 +38,11 @@ pub fn spawn_sync(state: AppState, session: SyncSession) -> Result<(), AppError>
     AppState::ensure_parent(&job_path)?;
     let known_remote_ids = {
         let conn = db::connect(&db_path)?;
-        db::list_known_remote_ids(&conn, &session.source)?
+        if session.mode == "download" {
+            db::list_remote_ids_requiring_download(&conn, &session.source)?
+        } else {
+            db::list_known_remote_ids(&conn, &session.source)?
+        }
     };
     let job = ScriptJob {
         session_id: &session.id,
@@ -58,6 +62,13 @@ pub fn spawn_sync(state: AppState, session: SyncSession) -> Result<(), AppError>
             let finished_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
             if let Ok(db_path) = state.db_path() {
                 if let Ok(conn) = db::connect(&db_path) {
+                    if db::list_sessions(&conn)
+                        .map(|items| items.iter().any(|item| item.id == session.id && item.status == "stopped"))
+                        .unwrap_or(false)
+                    {
+                        state.mark_finished(&session.id);
+                        return;
+                    }
                     let _ = db::update_session_progress(
                         &conn,
                         &session.id,
@@ -149,6 +160,7 @@ async fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> R
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
+    state.mark_process(&session.id, child.id())?;
 
     let stdout = child
         .stdout
@@ -233,6 +245,10 @@ async fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> R
                 )?;
                 db::insert_sync_event(&conn, &session.id, "info", &message)?;
             }
+            ScriptEvent::Profile { profile } => {
+                db::upsert_user_profile(&conn, &profile)?;
+                db::insert_sync_event(&conn, &session.id, "info", "已更新用户资料")?;
+            }
             ScriptEvent::ItemError { source_url, message } => {
                 let full_message = format!("抓取失败: {} ({})", message, source_url);
                 db::update_session_progress(
@@ -298,6 +314,14 @@ async fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> R
     let status = child.wait()?;
     state.mark_finished(&session.id);
     if !status.success() {
+        let conn = db::connect(&state.db_path()?)?;
+        let sessions = db::list_sessions(&conn)?;
+        if sessions
+            .iter()
+            .any(|item| item.id == session.id && item.status == "stopped")
+        {
+            return Ok(());
+        }
         return Err(AppError::Message(format!(
             "同步脚本退出码异常: {:?}",
             status.code()
@@ -424,7 +448,7 @@ fn run_diagnose_script(state: &AppState, source: &str, job_path: &Path) -> Resul
                 logs.push(error_message.clone());
                 message = error_message;
             }
-            ScriptEvent::Item { .. } | ScriptEvent::ItemError { .. } => {}
+            ScriptEvent::Item { .. } | ScriptEvent::ItemError { .. } | ScriptEvent::Profile { .. } => {}
         }
     }
 

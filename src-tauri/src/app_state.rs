@@ -1,5 +1,5 @@
 ﻿use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     fs,
     path::{Path, PathBuf},
@@ -7,6 +7,7 @@
 };
 
 use serde::{Deserialize, Serialize};
+use chrono::Local;
 
 use crate::{db, error::AppError};
 
@@ -32,6 +33,7 @@ pub struct AppState {
     pub chrome_cdp_port: u16,
     paths: Arc<Mutex<AppPaths>>,
     active_sessions: Arc<Mutex<HashSet<String>>>,
+    active_processes: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl AppState {
@@ -42,6 +44,8 @@ impl AppState {
         let paths = build_paths(data_root);
         ensure_data_dirs(&paths)?;
         let conn = db::connect(&paths.db_path)?;
+        let finished_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        db::reset_running_sessions(&conn, "程序已重新启动，旧同步任务已停止", &finished_at)?;
         drop(conn);
 
         Ok(Self {
@@ -51,6 +55,7 @@ impl AppState {
             chrome_cdp_port: 19222,
             paths: Arc::new(Mutex::new(paths)),
             active_sessions: Arc::new(Mutex::new(HashSet::new())),
+            active_processes: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -109,6 +114,25 @@ impl AppState {
         if let Ok(mut guard) = self.active_sessions.lock() {
             guard.remove(session_id);
         }
+        if let Ok(mut guard) = self.active_processes.lock() {
+            guard.remove(session_id);
+        }
+    }
+
+    pub fn mark_process(&self, session_id: &str, process_id: u32) -> Result<(), AppError> {
+        let mut guard = self
+            .active_processes
+            .lock()
+            .map_err(|_| AppError::Message("active process lock poisoned".into()))?;
+        guard.insert(session_id.to_string(), process_id);
+        Ok(())
+    }
+
+    pub fn process_id(&self, session_id: &str) -> Option<u32> {
+        self.active_processes
+            .lock()
+            .ok()
+            .and_then(|items| items.get(session_id).copied())
     }
 
     pub fn set_data_root(&self, new_root: PathBuf, migrate: bool) -> Result<(), AppError> {

@@ -50,6 +50,18 @@ pub struct LoginStatus {
     pub page_title: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserProfile {
+    pub name: String,
+    pub avatar_url: Option<String>,
+    pub likes: String,
+    pub followers: String,
+    pub following: String,
+    pub bio: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncSession {
@@ -96,6 +108,7 @@ pub struct ContentItem {
     pub local_dir: Option<String>,
     pub synced_at: String,
     pub downloaded: bool,
+    pub raw_json: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +148,8 @@ pub enum ScriptEvent {
     },
     #[serde(rename = "item")]
     Item { item: ScriptItem },
+    #[serde(rename = "profile")]
+    Profile { profile: UserProfile },
     #[serde(rename = "item_error")]
     ItemError {
         #[serde(alias = "sourceUrl")]
