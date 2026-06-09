@@ -6,8 +6,9 @@
     sync::{Arc, Mutex},
 };
 
-use serde::{Deserialize, Serialize};
 use chrono::Local;
+use serde::{Deserialize, Serialize};
+use tauri::{Webview, Wry};
 
 use crate::{db, error::AppError};
 
@@ -23,6 +24,34 @@ pub struct AppPaths {
 #[derive(Debug, Serialize, Deserialize)]
 struct AppConfig {
     data_root: String,
+}
+
+#[derive(Default)]
+pub struct BrowserPanelState {
+    webview: Mutex<Option<Webview<Wry>>>,
+    split_width: Mutex<Option<f64>>,
+}
+
+impl BrowserPanelState {
+    pub fn set_webview(&self, webview: Webview<Wry>) {
+        if let Ok(mut guard) = self.webview.lock() {
+            *guard = Some(webview);
+        }
+    }
+
+    pub fn webview(&self) -> Option<Webview<Wry>> {
+        self.webview.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    pub fn set_split_width(&self, width: f64) {
+        if let Ok(mut guard) = self.split_width.lock() {
+            *guard = Some(width);
+        }
+    }
+
+    pub fn split_width(&self) -> Option<f64> {
+        self.split_width.lock().ok().and_then(|guard| *guard)
+    }
 }
 
 #[derive(Clone)]

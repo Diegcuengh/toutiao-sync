@@ -9,9 +9,23 @@ mod error;
 mod models;
 mod sync;
 
-use app_state::AppState;
-use std::path::{Path, PathBuf};
-use tauri::{path::BaseDirectory, Manager};
+use app_state::{AppState, BrowserPanelState};
+use std::{path::{Path, PathBuf}, sync::Arc};
+use tauri::{
+    path::BaseDirectory,
+    webview::WebviewBuilder,
+    LogicalPosition, LogicalSize, Manager, Webview, WebviewUrl, WindowEvent, Wry,
+};
+
+const TOP_TOOLBAR_HEIGHT: f64 = 88.0;
+
+fn resize_browser_webview(browser: &Webview<Wry>, width: f64, height: f64, left_width: f64) {
+    let left_width = left_width.max(320.0);
+    let right_width = (width - left_width).max(320.0);
+    let right_height = (height - TOP_TOOLBAR_HEIGHT).max(320.0);
+    let _ = browser.set_position(LogicalPosition::new(left_width, TOP_TOOLBAR_HEIGHT));
+    let _ = browser.set_size(LogicalSize::new(right_width, right_height));
+}
 
 fn first_existing_path(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates.iter().find(|path| path.exists()).cloned()
@@ -80,8 +94,47 @@ fn main() {
             };
             let state = AppState::new(data_dir, script_path)?;
             app.manage(state);
+            let browser_panel_state = Arc::new(BrowserPanelState::default());
+            app.manage(browser_panel_state.clone());
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title(build_info::APP_TITLE);
+                let size = window.inner_size()?;
+                let logical_size = size.to_logical::<f64>(window.scale_factor()?);
+                let left_width = (logical_size.width / 2.0).max(320.0);
+                browser_panel_state.set_split_width(left_width);
+                let browser_width = (logical_size.width - left_width).max(320.0);
+                let browser = WebviewBuilder::new(
+                    "toutiao_browser",
+                    WebviewUrl::External("https://www.toutiao.com/".parse()?),
+                );
+                let browser = window.as_ref().window().add_child(
+                    browser,
+                    LogicalPosition::new(left_width, TOP_TOOLBAR_HEIGHT),
+                    LogicalSize::new(
+                        browser_width,
+                        (logical_size.height - TOP_TOOLBAR_HEIGHT).max(320.0),
+                    ),
+                )?;
+                browser_panel_state.set_webview(browser.clone());
+                let window_for_resize = window.clone();
+                let browser_for_resize = browser.clone();
+                let panel_state_for_resize = browser_panel_state.clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::Resized(size) = event {
+                        if let Ok(scale_factor) = window_for_resize.scale_factor() {
+                            let logical_size = size.to_logical::<f64>(scale_factor);
+                            let left_width = panel_state_for_resize
+                                .split_width()
+                                .unwrap_or(logical_size.width / 2.0);
+                            resize_browser_webview(
+                                &browser_for_resize,
+                                logical_size.width,
+                                logical_size.height,
+                                left_width,
+                            );
+                        }
+                    }
+                });
             }
             Ok(())
         })
@@ -90,6 +143,8 @@ fn main() {
             commands::choose_data_directory,
             commands::migrate_data_directory,
             commands::launch_debug_chrome,
+            commands::open_toutiao_in_panel,
+            commands::resize_toutiao_panel,
             commands::check_toutiao_login,
             commands::diagnose_page,
             commands::start_sync,

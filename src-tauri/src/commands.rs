@@ -1,11 +1,11 @@
-﻿use std::{path::{Path, PathBuf}, process::Command};
+﻿use std::{path::{Path, PathBuf}, process::Command, sync::Arc};
 
 use chrono::Local;
-use tauri::State;
+use tauri::{LogicalPosition, LogicalSize, State, Webview, Wry};
 use uuid::Uuid;
 
 use crate::{
-    app_state::AppState,
+    app_state::{AppState, BrowserPanelState},
     build_info,
     db,
     error::AppError,
@@ -28,6 +28,28 @@ fn resolve_chrome_exe() -> Result<&'static str, AppError> {
         }
     }
     Err(AppError::Message("未找到 Chrome，请先安装 Chrome。".into()))
+}
+
+fn apply_browser_panel_layout(webview: &Webview<Wry>, left_width: f64) -> Result<(), AppError> {
+    const TOP_TOOLBAR_HEIGHT: f64 = 88.0;
+    let window = webview.window();
+    let size = window
+        .inner_size()
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    let scale_factor = window
+        .scale_factor()
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    let logical_size = size.to_logical::<f64>(scale_factor);
+    let left_width = left_width.max(320.0);
+    let right_width = (logical_size.width - left_width).max(320.0);
+    let right_height = (logical_size.height - TOP_TOOLBAR_HEIGHT).max(320.0);
+    webview
+        .set_position(LogicalPosition::new(left_width, TOP_TOOLBAR_HEIGHT))
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    webview
+        .set_size(LogicalSize::new(right_width, right_height))
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    Ok(())
 }
 
 fn make_bootstrap(state: &AppState) -> Result<AppBootstrap, AppError> {
@@ -176,6 +198,34 @@ pub fn launch_debug_chrome(state: State<'_, AppState>) -> Result<(), AppError> {
         .arg("https://www.toutiao.com/")
         .spawn()?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn open_toutiao_in_panel(browser: State<'_, Arc<BrowserPanelState>>) -> Result<(), AppError> {
+    log_command("open_toutiao_in_panel");
+    let Some(webview) = browser.webview() else {
+        return Err(AppError::Message("右侧内置浏览器未就绪".into()));
+    };
+    webview
+        .eval("window.location.href = 'https://www.toutiao.com/';")
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    webview
+        .set_focus()
+        .map_err(|error| AppError::Message(error.to_string()))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn resize_toutiao_panel(
+    browser: State<'_, Arc<BrowserPanelState>>,
+    left_width: f64,
+) -> Result<(), AppError> {
+    log_command("resize_toutiao_panel");
+    let Some(webview) = browser.webview() else {
+        return Err(AppError::Message("右侧内置浏览器未就绪".into()));
+    };
+    browser.set_split_width(left_width);
+    apply_browser_panel_layout(&webview, left_width)
 }
 
 #[tauri::command]

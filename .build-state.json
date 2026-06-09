@@ -1,7 +1,13 @@
 {
   "major": 0,
   "minor": 7,
+<<<<<<< HEAD
   "patch": 4,
   "buildDate": "2026-06-08",
   "buildTime": "21:37:10"
+=======
+  "patch": 9,
+  "buildDate": "2026-06-06",
+  "buildTime": "13:11:11"
+>>>>>>> 9d872f6f7fc50d881e4431c4a9e376bf651f3e86
 }

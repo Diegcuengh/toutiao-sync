@@ -7,13 +7,14 @@ import {
   chooseDataDirectory,
   diagnosePage,
   getUserProfile,
-  launchDebugChrome,
+  openToutiaoInPanel,
   listSessions,
   listSyncEvents,
   migrateDataDirectory,
   openDownloadDir,
   openItemDir,
   openItemFile,
+  resizeToutiaoPanel,
   searchItemsWithType,
   startSync,
   stopSync,
@@ -38,11 +39,63 @@ const diagnosis = ref<PageDiagnosis | null>(null);
 const loginStatus = ref<LoginStatus | null>(null);
 const settingsOpen = ref(false);
 const error = ref("");
+const leftPaneWidth = ref(0);
+const resizing = ref(false);
 let timer: number | undefined;
+
+const minLeftPaneWidth = 360;
+const minRightPaneWidth = 360;
 
 const latestSession = computed(() => sessions.value[0] ?? null);
 const effectiveSessionId = computed(() => selectedSessionId.value || latestSession.value?.id || "");
 const runningSession = computed(() => sessions.value.find((session) => session.status === "running") ?? null);
+
+function clampLeftPaneWidth(width: number) {
+  const windowWidth = window.innerWidth || 1200;
+  const maxLeft = Math.max(minLeftPaneWidth, windowWidth - minRightPaneWidth);
+  return Math.round(Math.min(Math.max(width, minLeftPaneWidth), maxLeft));
+}
+
+async function applySplitWidth(width: number) {
+  const nextWidth = clampLeftPaneWidth(width);
+  leftPaneWidth.value = nextWidth;
+  document.documentElement.style.setProperty("--left-pane-width", `${nextWidth}px`);
+  try {
+    await resizeToutiaoPanel(nextWidth);
+  } catch {
+    // The command is unavailable in browser preview mode; layout still updates locally.
+  }
+}
+
+function handleResizeMove(event: PointerEvent) {
+  if (!resizing.value) {
+    return;
+  }
+  void applySplitWidth(event.clientX);
+}
+
+function stopResize() {
+  if (!resizing.value) {
+    return;
+  }
+  resizing.value = false;
+  document.body.classList.remove("is-resizing");
+  window.removeEventListener("pointermove", handleResizeMove);
+  window.removeEventListener("pointerup", stopResize);
+}
+
+function startResize(event: PointerEvent) {
+  event.preventDefault();
+  resizing.value = true;
+  document.body.classList.add("is-resizing");
+  window.addEventListener("pointermove", handleResizeMove);
+  window.addEventListener("pointerup", stopResize);
+}
+
+function handleWindowResize() {
+  const nextWidth = leftPaneWidth.value || window.innerWidth / 2;
+  void applySplitWidth(nextWidth);
+}
 
 function parseRawJson(item: ContentItem) {
   try {
@@ -211,6 +264,21 @@ async function handleMigrateDataDirectory() {
   }
 }
 
+async function handleOpenToutiaoPanel() {
+  error.value = "";
+  try {
+    await openToutiaoInPanel();
+    loginStatus.value = {
+      loggedIn: false,
+        loginRequired: true,
+        source: syncSource.value,
+        message: "已在右侧打开今日头条，请登录后点击“刷新”",
+      };
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
 
 
 async function handleSearch() {
@@ -244,6 +312,8 @@ watch(syncSource, () => {
 });
 
 onMounted(async () => {
+  await applySplitWidth(window.innerWidth / 2);
+  window.addEventListener("resize", handleWindowResize);
   await loadAll();
   await handleCheckLogin();
   timer = window.setInterval(loadAll, 3000);
@@ -253,6 +323,8 @@ onBeforeUnmount(() => {
   if (timer) {
     window.clearInterval(timer);
   }
+  window.removeEventListener("resize", handleWindowResize);
+  stopResize();
 });
 </script>
 
@@ -269,6 +341,10 @@ onBeforeUnmount(() => {
       </button>
       <button v-if="syncing" class="danger" @click="handleStopSync">停止同步</button>
       <button class="secondary" :disabled="syncing" @click="handleDownloadContent">下载内容</button>
+<<<<<<< HEAD
+=======
+      <button class="secondary" @click="handleOpenToutiaoPanel">打开右侧头条</button>
+>>>>>>> 9d872f6f7fc50d881e4431c4a9e376bf651f3e86
       <button class="secondary" @click="handleDiagnose">诊断当前页面</button>
       <button class="secondary" @click="activeTab = 'history'">日志</button>
       <div class="toolbar-search">
@@ -282,6 +358,7 @@ onBeforeUnmount(() => {
       <button class="icon-button" aria-label="设置" title="设置" @click="settingsOpen = !settingsOpen">⚙</button>
     </section>
 
+    <div class="left-pane">
     <p v-if="error" class="error">{{ error }}</p>
 
     <section v-if="settingsOpen" class="panel settings-panel">
@@ -304,8 +381,13 @@ onBeforeUnmount(() => {
     <section class="profile-shell">
       <div class="login-status" :class="{ ok: loginStatus?.loggedIn, danger: loginStatus?.loginRequired }">
         <strong>登录状态：{{ loginChecking ? "检查中..." : loginStatus?.loggedIn ? "已登录" : "未登录" }}</strong>
+<<<<<<< HEAD
         <span>{{ loginStatus?.message || "点击“刷新”检查当前是否已登录今日头条" }}</span>
         <button class="status-refresh" type="button" :disabled="loginChecking" @click="handleCheckLogin">
+=======
+        <span>{{ loginStatus?.message || "点击“刷新”查看当前登录状态" }}</span>
+        <button class="status-refresh" :disabled="loginChecking" @click="handleCheckLogin">
+>>>>>>> 9d872f6f7fc50d881e4431c4a9e376bf651f3e86
           {{ loginChecking ? "刷新中..." : "刷新" }}
         </button>
       </div>
@@ -504,7 +586,14 @@ onBeforeUnmount(() => {
         </section>
       </div>
     </section>
+    </div>
   </main>
+  <div
+    class="split-resizer"
+    :class="{ active: resizing }"
+    title="拖动调整左右栏宽度"
+    @pointerdown="startResize"
+  ></div>
 </template>
 
 <style scoped>
