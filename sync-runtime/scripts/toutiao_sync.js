@@ -330,7 +330,7 @@ async function emitLoginStatus(page, source) {
     source,
     message: loggedIn
       ? "已登录今日头条，可以同步"
-      : "未登录：请在 Chrome 中登录今日头条，登录后点击“刷新”",
+      : "未登录：请在右侧浏览器中登录今日头条，登录后点击“刷新”",
     pageUrl: loginState.url,
     pageTitle: loginState.title,
   });

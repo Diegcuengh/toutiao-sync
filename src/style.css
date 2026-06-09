@@ -445,11 +445,11 @@ a {
 }
 
 .status-refresh {
-<<<<<<< HEAD
   height: auto;
   min-width: 0;
   padding: 0;
   border: 0;
+  border-radius: 0;
   background: transparent;
   color: #2563eb;
   font-size: 15px;
@@ -462,22 +462,11 @@ a {
   text-decoration: underline;
   transform: none;
   box-shadow: none;
-=======
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  color: #2563eb;
-  font-weight: 500;
->>>>>>> 9d872f6f7fc50d881e4431c4a9e376bf651f3e86
 }
 
 .status-refresh:disabled {
   color: #94a3b8;
-<<<<<<< HEAD
   cursor: wait;
-=======
->>>>>>> 9d872f6f7fc50d881e4431c4a9e376bf651f3e86
 }
 
 .error {

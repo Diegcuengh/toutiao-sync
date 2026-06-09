@@ -49,6 +49,7 @@ const minRightPaneWidth = 360;
 const latestSession = computed(() => sessions.value[0] ?? null);
 const effectiveSessionId = computed(() => selectedSessionId.value || latestSession.value?.id || "");
 const runningSession = computed(() => sessions.value.find((session) => session.status === "running") ?? null);
+const visibleProfile = computed(() => (loginStatus.value?.loggedIn ? profile.value : null));
 
 function clampLeftPaneWidth(width: number) {
   const windowWidth = window.innerWidth || 1200;
@@ -225,7 +226,7 @@ async function handleCheckLogin() {
   error.value = "";
   try {
     loginStatus.value = await checkToutiaoLogin({ source: syncSource.value });
-    profile.value = await getUserProfile();
+    profile.value = loginStatus.value.loggedIn ? await getUserProfile() : null;
   } catch (err) {
     loginStatus.value = {
       loggedIn: false,
@@ -233,6 +234,7 @@ async function handleCheckLogin() {
       source: syncSource.value,
       message: err instanceof Error ? err.message : String(err),
     };
+    profile.value = null;
   } finally {
     loginChecking.value = false;
   }
@@ -268,12 +270,13 @@ async function handleOpenToutiaoPanel() {
   error.value = "";
   try {
     await openToutiaoInPanel();
+    profile.value = null;
     loginStatus.value = {
       loggedIn: false,
-        loginRequired: true,
-        source: syncSource.value,
-        message: "已在右侧打开今日头条，请登录后点击“刷新”",
-      };
+      loginRequired: true,
+      source: syncSource.value,
+      message: "已在右侧打开今日头条，请登录后点击“刷新”",
+    };
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   }
@@ -309,6 +312,7 @@ watch(effectiveSessionId, async (value) => {
 watch(syncSource, () => {
   loginStatus.value = null;
   diagnosis.value = null;
+  profile.value = null;
 });
 
 onMounted(async () => {
@@ -341,10 +345,7 @@ onBeforeUnmount(() => {
       </button>
       <button v-if="syncing" class="danger" @click="handleStopSync">停止同步</button>
       <button class="secondary" :disabled="syncing" @click="handleDownloadContent">下载内容</button>
-<<<<<<< HEAD
-=======
       <button class="secondary" @click="handleOpenToutiaoPanel">打开右侧头条</button>
->>>>>>> 9d872f6f7fc50d881e4431c4a9e376bf651f3e86
       <button class="secondary" @click="handleDiagnose">诊断当前页面</button>
       <button class="secondary" @click="activeTab = 'history'">日志</button>
       <div class="toolbar-search">
@@ -381,28 +382,23 @@ onBeforeUnmount(() => {
     <section class="profile-shell">
       <div class="login-status" :class="{ ok: loginStatus?.loggedIn, danger: loginStatus?.loginRequired }">
         <strong>登录状态：{{ loginChecking ? "检查中..." : loginStatus?.loggedIn ? "已登录" : "未登录" }}</strong>
-<<<<<<< HEAD
         <span>{{ loginStatus?.message || "点击“刷新”检查当前是否已登录今日头条" }}</span>
         <button class="status-refresh" type="button" :disabled="loginChecking" @click="handleCheckLogin">
-=======
-        <span>{{ loginStatus?.message || "点击“刷新”查看当前登录状态" }}</span>
-        <button class="status-refresh" :disabled="loginChecking" @click="handleCheckLogin">
->>>>>>> 9d872f6f7fc50d881e4431c4a9e376bf651f3e86
           {{ loginChecking ? "刷新中..." : "刷新" }}
         </button>
       </div>
       <div class="profile-banner">
         <div class="profile-avatar">
-          <img v-if="profile?.avatarUrl" :src="profile.avatarUrl" alt="" />
+          <img v-if="visibleProfile?.avatarUrl" :src="visibleProfile.avatarUrl" alt="" />
         </div>
         <div class="profile-info">
-          <h1>{{ profile?.name || "未登录" }}</h1>
+          <h1>{{ visibleProfile?.name || "未登录" }}</h1>
           <div class="profile-stats">
-            <span><strong>{{ profile?.likes || "-" }}</strong>获赞</span>
-            <span><strong>{{ profile?.followers || "-" }}</strong>粉丝</span>
-            <span><strong>{{ profile?.following || "-" }}</strong>关注</span>
+            <span><strong>{{ visibleProfile?.likes || "-" }}</strong>获赞</span>
+            <span><strong>{{ visibleProfile?.followers || "-" }}</strong>粉丝</span>
+            <span><strong>{{ visibleProfile?.following || "-" }}</strong>关注</span>
           </div>
-          <p>简介：{{ profile?.bio || "同步列表后自动获取" }}</p>
+          <p>简介：{{ visibleProfile?.bio || "同步列表后自动获取" }}</p>
           <a class="profile-more" href="#">更多信息 〉</a>
         </div>
       </div>
