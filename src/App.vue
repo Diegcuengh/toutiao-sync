@@ -172,6 +172,7 @@ async function handleCheckLogin() {
   error.value = "";
   try {
     loginStatus.value = await checkToutiaoLogin({ source: syncSource.value });
+    profile.value = await getUserProfile();
   } catch (err) {
     loginStatus.value = {
       loggedIn: false,
@@ -268,9 +269,6 @@ onBeforeUnmount(() => {
       </button>
       <button v-if="syncing" class="danger" @click="handleStopSync">停止同步</button>
       <button class="secondary" :disabled="syncing" @click="handleDownloadContent">下载内容</button>
-      <button class="secondary" :disabled="loginChecking" @click="handleCheckLogin">
-        {{ loginChecking ? "检查中..." : "检查登录" }}
-      </button>
       <button class="secondary" @click="handleDiagnose">诊断当前页面</button>
       <button class="secondary" @click="activeTab = 'history'">日志</button>
       <div class="toolbar-search">
@@ -306,8 +304,10 @@ onBeforeUnmount(() => {
     <section class="profile-shell">
       <div class="login-status" :class="{ ok: loginStatus?.loggedIn, danger: loginStatus?.loginRequired }">
         <strong>登录状态：{{ loginChecking ? "检查中..." : loginStatus?.loggedIn ? "已登录" : "未登录" }}</strong>
-        <span>{{ loginStatus?.message || "点击“检查登录”查看当前 Chrome 是否已登录今日头条" }}</span>
-        <a v-if="loginStatus?.pageUrl" :href="loginStatus.pageUrl" target="_blank" rel="noreferrer">当前页面</a>
+        <span>{{ loginStatus?.message || "点击“刷新”检查当前是否已登录今日头条" }}</span>
+        <button class="status-refresh" type="button" :disabled="loginChecking" @click="handleCheckLogin">
+          {{ loginChecking ? "刷新中..." : "刷新" }}
+        </button>
       </div>
       <div class="profile-banner">
         <div class="profile-avatar">

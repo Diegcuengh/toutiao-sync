@@ -395,6 +395,30 @@ a {
   color: #b45309;
 }
 
+.status-refresh {
+  height: auto;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #2563eb;
+  font-size: 15px;
+  font-weight: 500;
+  box-shadow: none;
+}
+
+.status-refresh:hover:not(:disabled) {
+  color: #1d4ed8;
+  text-decoration: underline;
+  transform: none;
+  box-shadow: none;
+}
+
+.status-refresh:disabled {
+  color: #94a3b8;
+  cursor: wait;
+}
+
 .error {
   color: #fca5a5;
 }

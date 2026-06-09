@@ -317,6 +317,12 @@ async function emitLoginStatus(page, source) {
     loginState = await detectLoginState(page);
   }
   const loggedIn = loginState.isLoggedIn && !loginState.loginRequired;
+  if (loggedIn) {
+    const profile = await collectProfile(page);
+    if (profile.name || profile.avatarUrl) {
+      emit({ type: "profile", profile });
+    }
+  }
   emit({
     type: "login_status",
     loggedIn,
@@ -324,7 +330,7 @@ async function emitLoginStatus(page, source) {
     source,
     message: loggedIn
       ? "已登录今日头条，可以同步"
-      : "未登录：请在 Chrome 中登录今日头条，登录后点击“检查登录”",
+      : "未登录：请在 Chrome 中登录今日头条，登录后点击“刷新”",
     pageUrl: loginState.url,
     pageTitle: loginState.title,
   });

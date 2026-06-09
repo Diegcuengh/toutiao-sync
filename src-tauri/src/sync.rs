@@ -364,8 +364,18 @@ fn run_login_status_script(state: &AppState, source: &str, job_path: &Path) -> R
             continue;
         }
         let value: serde_json::Value = serde_json::from_str(&line)?;
-        if value.get("type").and_then(|item| item.as_str()) == Some("login_status") {
-            login_status = Some(serde_json::from_value::<LoginStatus>(value)?);
+        match value.get("type").and_then(|item| item.as_str()) {
+            Some("login_status") => {
+                login_status = Some(serde_json::from_value::<LoginStatus>(value)?);
+            }
+            Some("profile") => {
+                if let Some(profile_value) = value.get("profile") {
+                    let profile = serde_json::from_value(profile_value.clone())?;
+                    let conn = db::connect(&state.db_path()?)?;
+                    db::upsert_user_profile(&conn, &profile)?;
+                }
+            }
+            _ => {}
         }
     }
 
