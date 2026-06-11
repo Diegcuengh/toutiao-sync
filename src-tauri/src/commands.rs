@@ -1,8 +1,11 @@
 ﻿use std::{path::{Path, PathBuf}, process::Command, sync::Arc};
 
 use chrono::Local;
+use std::{sync::mpsc, time::Duration};
 use tauri::{LogicalPosition, LogicalSize, State, Webview, Wry};
 use uuid::Uuid;
+#[cfg(windows)]
+use webview2_com::{CoTaskMemPWSTR, ExecuteScriptCompletedHandler};
 
 use crate::{
     app_state::{AppState, BrowserPanelState},
@@ -50,6 +53,158 @@ fn apply_browser_panel_layout(webview: &Webview<Wry>, left_width: f64) -> Result
         .set_size(LogicalSize::new(right_width, right_height))
         .map_err(|error| AppError::Message(error.to_string()))?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn detect_login_from_browser_panel(
+    browser: &BrowserPanelState,
+    source: &str,
+) -> Result<Option<(LoginStatus, Option<UserProfile>)>, AppError> {
+    let Some(webview) = browser.webview() else {
+        return Ok(None);
+    };
+
+    let current_url = webview
+        .url()
+        .map_err(|error| AppError::Message(error.to_string()))?
+        .to_string();
+    if !current_url.contains("toutiao.com") {
+        return Ok(Some((
+            LoginStatus {
+                logged_in: false,
+                login_required: true,
+                source: source.to_string(),
+                message: "未登录：请先在右侧浏览器打开并登录今日头条，再点击“刷新”".into(),
+                page_url: Some(current_url),
+                page_title: None,
+            },
+            None,
+        )));
+    }
+
+    let script = r#"
+(() => {
+  const text = (selector) => document.querySelector(selector)?.textContent?.replace(/\s+/g, " ").trim() || "";
+  const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ");
+  const anchors = Array.from(document.querySelectorAll("a[href]")).map((anchor) => ({
+    href: anchor.href || "",
+    text: (anchor.textContent || anchor.getAttribute("title") || "").replace(/\s+/g, " ").trim(),
+  }));
+  const hasProfileEntry = anchors.some((item) => item.href.includes("/c/user/token/"));
+  const hasSourceEntry = anchors.some((item) => (
+    item.href.includes("/c/user/token/") &&
+    (item.text.includes("我的收藏") || item.href.includes("tab=fav") || item.href.includes("source=mine_profile"))
+  ));
+  const visibleLoginButtons = Array.from(document.querySelectorAll("a, button, [role='button'], div, span"))
+    .map((element) => {
+      const text = (element.textContent || "").replace(/\s+/g, " ").trim();
+      const rect = element.getBoundingClientRect();
+      return { text, top: rect.top, width: rect.width, height: rect.height };
+    })
+    .filter((item) => item.top >= 0 && item.top < 260 && item.width > 0 && item.height > 0)
+    .some((item) => ["登录", "立即登录"].includes(item.text) || item.text.includes("请登录"));
+  const loginUrl = /login|passport|sso/i.test(location.href);
+  const loginText = /请登录|立即登录|手机号登录|验证码登录|扫码登录/.test(bodyText);
+  const loggedIn = !loginUrl && !visibleLoginButtons && !loginText && (hasSourceEntry || hasProfileEntry);
+  const avatar =
+    document.querySelector("img[src*='avatar']") ||
+    Array.from(document.querySelectorAll("img")).find((img) => {
+      const rect = img.getBoundingClientRect();
+      return rect.width >= 80 && rect.height >= 80 && rect.top < 320;
+    });
+  const name =
+    text("[class*='name']") ||
+    Array.from(document.querySelectorAll("h1, h2, strong, span"))
+      .map((node) => node.textContent?.trim() || "")
+      .find((value) => value && value.length <= 12 && !/^\d/.test(value)) ||
+    "";
+  const readMetric = (label) => {
+    const match = bodyText.match(new RegExp(`([\\d.万]+)\\s*${label}`));
+    return match?.[1] || "";
+  };
+  const bioMatch = bodyText.match(/简介[:：]\s*([^\n\r]+)/);
+  return {
+    loggedIn,
+    pageUrl: location.href,
+    pageTitle: document.title || "",
+    message: loggedIn ? "已登录今日头条，可以同步" : "未登录：请在右侧浏览器中登录今日头条，登录后点击“刷新”",
+    profile: loggedIn ? {
+      name,
+      avatarUrl: avatar?.currentSrc || avatar?.getAttribute?.("src") || null,
+      likes: readMetric("获赞"),
+      followers: readMetric("粉丝"),
+      following: readMetric("关注"),
+      bio: bioMatch?.[1]?.replace(/\s*更多信息.*/, "").trim() || "",
+      updatedAt: new Date().toISOString(),
+    } : null,
+  };
+})()
+"#;
+
+    let (sender, receiver) = mpsc::channel::<Result<String, String>>();
+    webview
+        .with_webview(move |platform_webview| unsafe {
+            let controller = platform_webview.controller();
+            let core = match controller.CoreWebView2() {
+                Ok(core) => core,
+                Err(error) => {
+                    let _ = sender.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let js = CoTaskMemPWSTR::from(script);
+            let _ = core.ExecuteScript(
+                *js.as_ref().as_pcwstr(),
+                &ExecuteScriptCompletedHandler::create(Box::new(move |_, result| {
+                    let _ = sender.send(Ok(result));
+                    Ok(())
+                })),
+            );
+        })
+        .map_err(|error| AppError::Message(error.to_string()))?;
+
+    let payload = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| AppError::Message("右侧页面登录检测超时".into()))?
+        .map_err(AppError::Message)?;
+
+    let value: serde_json::Value =
+        serde_json::from_str(&payload).map_err(|error| AppError::Message(error.to_string()))?;
+    let page_url = value.get("pageUrl").and_then(|item| item.as_str()).map(|item| item.to_string());
+    let page_title = value.get("pageTitle").and_then(|item| item.as_str()).map(|item| item.to_string());
+    let logged_in = value.get("loggedIn").and_then(|item| item.as_bool()).unwrap_or(false);
+    let message = value
+        .get("message")
+        .and_then(|item| item.as_str())
+        .unwrap_or("登录状态未知")
+        .to_string();
+    let profile = value
+        .get("profile")
+        .cloned()
+        .filter(|item| !item.is_null())
+        .map(serde_json::from_value::<UserProfile>)
+        .transpose()
+        .map_err(|error| AppError::Message(error.to_string()))?;
+
+    Ok(Some((
+        LoginStatus {
+            logged_in,
+            login_required: !logged_in,
+            source: source.to_string(),
+            message,
+            page_url,
+            page_title,
+        },
+        profile,
+    )))
+}
+
+#[cfg(not(windows))]
+fn detect_login_from_browser_panel(
+    _browser: &BrowserPanelState,
+    _source: &str,
+) -> Result<Option<(LoginStatus, Option<UserProfile>)>, AppError> {
+    Ok(None)
 }
 
 fn make_bootstrap(state: &AppState) -> Result<AppBootstrap, AppError> {
@@ -174,9 +329,19 @@ pub fn diagnose_page(
 #[tauri::command]
 pub fn check_toutiao_login(
     state: State<'_, AppState>,
+    browser: State<'_, Arc<BrowserPanelState>>,
     request: DiagnosePageRequest,
 ) -> Result<LoginStatus, AppError> {
     log_command("check_toutiao_login");
+    if let Some((login_status, profile)) = detect_login_from_browser_panel(browser.inner(), &request.source)? {
+        if login_status.logged_in {
+            if let Some(profile) = profile {
+                let conn = db::connect(&state.db_path()?)?;
+                db::upsert_user_profile(&conn, &profile)?;
+            }
+        }
+        return Ok(login_status);
+    }
     sync::check_login_status(state.inner(), &request.source)
 }
 

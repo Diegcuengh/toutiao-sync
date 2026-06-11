@@ -1,6 +1,7 @@
 ﻿<script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import appLogo from "./assets/logo.png";
+import defaultAvatar from "./assets/default-avatar.svg";
 import {
   bootstrapApp,
   checkToutiaoLogin,
@@ -382,14 +383,14 @@ onBeforeUnmount(() => {
     <section class="profile-shell">
       <div class="login-status" :class="{ ok: loginStatus?.loggedIn, danger: loginStatus?.loginRequired }">
         <strong>登录状态：{{ loginChecking ? "检查中..." : loginStatus?.loggedIn ? "已登录" : "未登录" }}</strong>
-        <span>{{ loginStatus?.message || "点击“刷新”检查当前是否已登录今日头条" }}</span>
+        <span>{{ loginStatus?.message || "在右栏目登陆后，点击“刷新”检查当前是否已登录今日头条" }}</span>
         <button class="status-refresh" type="button" :disabled="loginChecking" @click="handleCheckLogin">
           {{ loginChecking ? "刷新中..." : "刷新" }}
         </button>
       </div>
       <div class="profile-banner">
         <div class="profile-avatar">
-          <img v-if="visibleProfile?.avatarUrl" :src="visibleProfile.avatarUrl" alt="" />
+          <img :src="visibleProfile?.avatarUrl || defaultAvatar" alt="" />
         </div>
         <div class="profile-info">
           <h1>{{ visibleProfile?.name || "未登录" }}</h1>
@@ -398,7 +399,7 @@ onBeforeUnmount(() => {
             <span><strong>{{ visibleProfile?.followers || "-" }}</strong>粉丝</span>
             <span><strong>{{ visibleProfile?.following || "-" }}</strong>关注</span>
           </div>
-          <p>简介：{{ visibleProfile?.bio || "同步列表后自动获取" }}</p>
+          <p>简介：{{ visibleProfile?.bio || "-" }}</p>
           <a class="profile-more" href="#">更多信息 〉</a>
         </div>
       </div>
