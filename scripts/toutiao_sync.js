@@ -142,6 +142,7 @@ async function connectChrome(job) {
   const candidatePorts = Array.from(new Set([Number(job.cdpPort) || 9222, 19022, 19222, 19333, 19444, 19555]));
   for (const port of candidatePorts) {
     if (probeChromeDebugger(port)) {
+      emitProgress(`复用 Chrome 调试端口 ${port}`);
       return chromium.connectOverCDP(`http://127.0.0.1:${port}`);
     }
   }
@@ -155,6 +156,7 @@ async function connectChrome(job) {
 
   const launchPort = candidatePorts[0];
   if (!probeChromeDebugger(launchPort)) {
+    emitProgress(`启动 Chrome 调试端口 ${launchPort}`);
     const chromeProcess = spawn(
       chromeExe,
       [
@@ -223,15 +225,23 @@ function stableLocalId(item) {
 }
 
 async function findToutiaoPage(browser) {
+  let reusablePage = null;
   for (const context of browser.contexts()) {
     for (const page of context.pages()) {
-      if (page.url().includes("toutiao.com")) {
+      const url = page.url();
+      if (url.includes("toutiao.com")) {
         return page;
+      }
+      if (
+        !reusablePage &&
+        (url === "about:blank" || (!url.startsWith("devtools://") && !url.startsWith("chrome://") && !url.startsWith("chrome-extension://")))
+      ) {
+        reusablePage = page;
       }
     }
   }
   const context = browser.contexts()[0] ?? (await browser.newContext());
-  const page = await context.newPage();
+  const page = reusablePage || (await context.newPage());
   await page.goto("https://www.toutiao.com/", { waitUntil: "domcontentloaded" });
   return page;
 }
@@ -330,7 +340,7 @@ async function emitLoginStatus(page, source) {
     source,
     message: loggedIn
       ? "已登录今日头条，可以同步"
-      : "未登录：请在右侧浏览器中登录今日头条，登录后点击“刷新”",
+      : "未登录：请在大家的chrome浏览器中登录，登录后点击“刷新”",
     pageUrl: loginState.url,
     pageTitle: loginState.title,
   });
@@ -340,6 +350,18 @@ async function inspectCurrentPage(page, source) {
   await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" }));
   await page.waitForTimeout(400);
   const info = await page.evaluate((currentSource) => {
+    const CONTENT_LINK_PATTERN = /\/(article|video|w)\//;
+    const getCardNodes = () =>
+      Array.from(document.querySelectorAll(".main-wrapper .main-l div.profile-wtt-card-wrapper"));
+    const getCardAnchors = (cards) =>
+      cards.flatMap((card) =>
+        Array.from(card.querySelectorAll("a[href]"))
+          .map((anchor) => ({
+            href: anchor.href || "",
+            text: (anchor.textContent || anchor.getAttribute("title") || "").replace(/\s+/g, " ").trim(),
+          }))
+          .filter((item) => item.href.includes("toutiao.com") && CONTENT_LINK_PATTERN.test(item.href)),
+      );
     const bodyText = document.body?.innerText || "";
     const title = document.title || "";
     const url = location.href;
@@ -371,15 +393,8 @@ async function inspectCurrentPage(page, source) {
       })
       .filter(Boolean);
     const activeTab = tabCandidates.sort((left, right) => right.score - left.score)[0]?.text || "";
-    const anchors = Array.from(document.querySelectorAll("a[href]"));
-    const toutiaoAnchors = anchors
-      .map((anchor) => {
-        const href = anchor.href;
-        const text = (anchor.textContent || anchor.getAttribute("title") || "").trim();
-        return { href, text };
-      })
-      .filter((item) => item.href.includes("toutiao.com"));
-    const contentAnchors = toutiaoAnchors.filter((item) => /\/(article|video|w)\//.test(item.href));
+    const cardNodes = getCardNodes();
+    const contentAnchors = getCardAnchors(cardNodes);
     const keywords = currentSource === "likes" ? ["喜欢", "赞过", "点赞"] : ["收藏", "我的收藏", "favorite"];
     const matchedKeyword =
       (currentSource === "likes" && ["喜欢", "赞过", "点赞"].includes(activeTab) ? activeTab : "") ||
@@ -398,14 +413,15 @@ async function inspectCurrentPage(page, source) {
       activeTab,
       bodyPreview: bodyText.replace(/\s+/g, " ").slice(0, 300),
       matchedKeyword: matchedKeyword || "",
-      toutiaoAnchorCount: toutiaoAnchors.length,
+      toutiaoAnchorCount: contentAnchors.length,
       contentAnchorCount: contentAnchors.length,
+      cardCount: cardNodes.length,
       sampleUrls: contentAnchors.slice(0, 5).map((item) => item.href),
     };
   }, source);
 
   emitProgress(
-    `页面诊断：${source === "likes" ? "喜欢" : "收藏"}，当前标签“${info.activeTab || "未知"}”，标题“${info.title}”，内容链接 ${info.contentAnchorCount} 个`,
+    `页面诊断：${source === "likes" ? "喜欢" : "收藏"}，当前标签“${info.activeTab || "未知"}”，标题“${info.title}”，卡片 ${info.cardCount || 0} 个，内容链接 ${info.contentAnchorCount} 个`,
     { pageUrl: info.url, pageTitle: info.title },
   );
   return info;
@@ -574,49 +590,236 @@ function assertPageLooksRight(info, source) {
 
 async function collectList(page) {
   await page.bringToFront();
-  await page.waitForTimeout(2000);
-  for (let index = 0; index < 8; index += 1) {
-    await page.mouse.wheel(0, 2200);
-    await page.waitForTimeout(1200);
+  await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" }));
+  await page.waitForTimeout(1200);
+
+  const readVisibleCards = async () =>
+    page.evaluate(() => {
+      const TITLE_TEXT_BLACKLIST = /^(分享|评论|点赞|收藏|喜欢|更多信息|全部|微头条|书架)$/;
+      const CONTENT_LINK_PATTERN = /\/(article|video|w)\//;
+      const cardNodes = Array.from(document.querySelectorAll(".main-wrapper .main-l div.profile-wtt-card-wrapper"));
+      const items = [];
+      for (const card of cardNodes) {
+        const anchors = Array.from(card.querySelectorAll("a[href]"));
+        const anchor = anchors.find((candidate) => {
+          const href = candidate.href || "";
+          return href.includes("toutiao.com") && CONTENT_LINK_PATTERN.test(href) && !href.includes("#comment");
+        });
+        if (!anchor) continue;
+        const url = anchor.href;
+        const titleCandidates = [
+          anchor.getAttribute("title") || "",
+          anchor.textContent || "",
+          ...anchors.map((candidate) => candidate.getAttribute("title") || ""),
+          ...anchors.map((candidate) => candidate.textContent || ""),
+          ...Array.from(card.querySelectorAll("h1, h2, h3, h4, strong, p, span")).map((node) => node.textContent || ""),
+        ]
+          .map((value) => value.replace(/\s+/g, " ").trim())
+          .filter((value) => value && value.length >= 6 && !TITLE_TEXT_BLACKLIST.test(value) && !/^\d+\s*(评论|播放|展现)$/.test(value));
+        const title =
+          titleCandidates.sort((left, right) => right.length - left.length)[0] ||
+          "";
+        if (!title) continue;
+        const summary = card.textContent?.replace(/\s+/g, " ").trim()?.slice(0, 220) || "";
+        const coverNode = card.querySelector?.("img, video[poster]");
+        const coverUrl =
+          coverNode?.getAttribute?.("poster") ||
+          coverNode?.currentSrc ||
+          coverNode?.getAttribute?.("src") ||
+          "";
+        items.push({
+          remoteId: url.split("/").filter(Boolean).pop() || url,
+          title,
+          summary,
+          sourceUrl: url,
+          contentType: url.includes("/video/") ? "video" : "article",
+          coverUrl,
+          listHtml: card.outerHTML || anchor.outerHTML || "",
+        });
+      }
+      return Array.from(new Map(items.map((item) => [item.sourceUrl, item])).values());
+    });
+
+  const scrollListPage = async () => {
+    const hoverPoint = await page.evaluate(() => {
+      const main = document.querySelector(".main-l") || document.querySelector(".main-wrapper") || document.body;
+      const rect = main.getBoundingClientRect();
+      return {
+        x: Math.max(20, Math.min(window.innerWidth - 20, rect.left + Math.min(rect.width * 0.55, 520))),
+        y: Math.max(120, Math.min(window.innerHeight - 80, rect.top + Math.min(rect.height * 0.65, 520))),
+      };
+    }).catch(() => ({ x: 520, y: 520 }));
+    await page.mouse.move(hoverPoint.x, hoverPoint.y).catch(() => {});
+    for (let wheelIndex = 0; wheelIndex < 3; wheelIndex += 1) {
+      await page.mouse.wheel(0, 650).catch(() => {});
+      await page.waitForTimeout(180);
+    }
+    return page.evaluate(() => {
+      const cards = Array.from(document.querySelectorAll(".main-wrapper .main-l div.profile-wtt-card-wrapper"));
+      const viewportStep = Math.max(650, Math.floor(window.innerHeight * 0.65));
+      const rawContainers = [
+        document.scrollingElement,
+        document.documentElement,
+        document.body,
+        document.querySelector(".main-wrapper"),
+        document.querySelector(".main-l"),
+        ...Array.from(document.querySelectorAll("div")).filter((element) => {
+          const style = window.getComputedStyle(element);
+          return (
+            element.scrollHeight > element.clientHeight + 80 &&
+            /(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflow}`)
+          );
+        }),
+      ].filter(Boolean);
+      const scrollContainers = Array.from(new Set(rawContainers));
+      document.documentElement.style.scrollBehavior = "auto";
+      document.documentElement.style.overflowAnchor = "none";
+      document.body.style.scrollBehavior = "auto";
+      document.body.style.overflowAnchor = "none";
+      const beforeWindowTop = window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
+      const beforeStates = scrollContainers.map((element) => ({
+        element,
+        top: element.scrollTop || 0,
+        max: Math.max(0, (element.scrollHeight || 0) - (element.clientHeight || 0)),
+      }));
+      const primary = beforeStates
+        .map((state) => ({
+          ...state,
+          cardCount: state.element.querySelectorAll?.(".profile-wtt-card-wrapper").length || 0,
+          width: state.element.getBoundingClientRect?.().width || window.innerWidth,
+        }))
+        .filter((state) => state.max > 0)
+        .sort((left, right) => right.cardCount - left.cardCount || right.max - left.max || right.width - left.width)[0]?.element;
+      if (primary) {
+        primary.style.scrollBehavior = "auto";
+        primary.style.overflowAnchor = "none";
+        primary.scrollTop = Math.min(
+          Math.max(0, (primary.scrollHeight || 0) - (primary.clientHeight || 0)),
+          (primary.scrollTop || 0) + viewportStep,
+        );
+      } else {
+        window.scrollBy(0, viewportStep);
+      }
+      window.scrollBy(0, Math.floor(viewportStep * 0.45));
+
+      const afterWindowTop = window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
+      const afterStates = beforeStates.map((state) => {
+        const rect = state.element.getBoundingClientRect?.();
+        const afterTop = state.element.scrollTop || 0;
+        const scrollHeight = state.element.scrollHeight || 0;
+        const clientHeight = state.element.clientHeight || window.innerHeight || 0;
+        return {
+          beforeTop: state.top,
+          afterTop,
+          moved: Math.abs(afterTop - state.top),
+          maxTop: Math.max(0, scrollHeight - clientHeight),
+          scrollHeight,
+          clientHeight,
+          tagName: state.element.tagName || "window",
+          className: typeof state.element.className === "string" ? state.element.className.slice(0, 80) : "",
+          width: rect?.width || window.innerWidth,
+        };
+      });
+      const activeState = afterStates
+        .sort((left, right) => right.moved - left.moved || right.maxTop - left.maxTop || right.width - left.width)[0] || {
+          beforeTop: beforeWindowTop,
+          afterTop: afterWindowTop,
+          moved: Math.abs(afterWindowTop - beforeWindowTop),
+          maxTop: 0,
+          scrollHeight: document.documentElement.scrollHeight || document.body.scrollHeight || 0,
+          clientHeight: window.innerHeight || 0,
+          tagName: "window",
+          className: "",
+        };
+      const pageScrollHeight = Math.max(
+        document.documentElement.scrollHeight || 0,
+        document.body.scrollHeight || 0,
+        activeState.scrollHeight || 0,
+      );
+      const pageClientHeight = Math.max(window.innerHeight || 0, activeState.clientHeight || 0);
+      const pageTop = Math.max(afterWindowTop, activeState.afterTop || 0);
+      const isAtBottom = pageTop + pageClientHeight >= pageScrollHeight - 40;
+      return {
+        beforeTop: Math.max(beforeWindowTop, activeState.beforeTop || 0),
+        afterTop: pageTop,
+        moved: Math.max(Math.abs(afterWindowTop - beforeWindowTop), activeState.moved || 0),
+        scrollHeight: pageScrollHeight,
+        clientHeight: pageClientHeight,
+        isAtBottom,
+        cardCount: cards.length,
+        container: `${activeState.tagName}${activeState.className ? `.${activeState.className}` : ""}`,
+      };
+    });
+  };
+
+  const seen = new Map();
+  let stableRounds = 0;
+  let bottomRounds = 0;
+  let lastScrollHeight = 0;
+
+  for (let index = 0; index < 80; index += 1) {
+    const batch = await readVisibleCards();
+    const beforeSize = seen.size;
+    for (const item of batch) {
+      if (!seen.has(item.sourceUrl)) {
+        seen.set(item.sourceUrl, item);
+        emitProgress(`发现内容 ${seen.size}: ${item.title} ${item.sourceUrl}`, {
+          candidates: seen.size,
+          pageUrl: item.sourceUrl,
+          pageTitle: item.title,
+        });
+      }
+    }
+    const scrollInfo = await scrollListPage();
+    await page.waitForTimeout(1600);
+    const afterScrollBatch = await readVisibleCards();
+    for (const item of afterScrollBatch) {
+      if (!seen.has(item.sourceUrl)) {
+        seen.set(item.sourceUrl, item);
+        emitProgress(`发现内容 ${seen.size}: ${item.title} ${item.sourceUrl}`, {
+          candidates: seen.size,
+          pageUrl: item.sourceUrl,
+          pageTitle: item.title,
+        });
+      }
+    }
+    if (seen.size === beforeSize) {
+      stableRounds += 1;
+    } else {
+      stableRounds = 0;
+    }
+    if (scrollInfo.isAtBottom && scrollInfo.scrollHeight === lastScrollHeight) {
+      bottomRounds += 1;
+    } else {
+      bottomRounds = 0;
+    }
+    lastScrollHeight = scrollInfo.scrollHeight;
+    emitProgress(
+      `滚动扫描 ${index + 1}：top ${Math.round(scrollInfo.afterTop)}/${Math.round(scrollInfo.scrollHeight)}，移动 ${Math.round(scrollInfo.moved)}，卡片 ${scrollInfo.cardCount}，累计 ${seen.size}，容器 ${scrollInfo.container}`,
+      {
+      candidates: seen.size,
+      pageUrl: page.url(),
+      pageTitle: await page.title().catch(() => ""),
+      },
+    );
+    if (bottomRounds >= 3 && stableRounds >= 2) {
+      break;
+    }
   }
 
-  const results = await page.evaluate(() => {
-    const anchors = Array.from(document.querySelectorAll("a[href]"));
-    const items = [];
-    for (const anchor of anchors) {
-      const url = anchor.href;
-      if (!url.includes("toutiao.com")) continue;
-      if (!/\/(article|video|w)\//.test(url)) continue;
-      if (url.includes("#comment")) continue;
-      const title = anchor.textContent?.trim() || anchor.getAttribute("title") || "";
-      if (!title) continue;
-      if (/^\d+\s*评论$/.test(title)) continue;
-      const container =
-        anchor.closest("article") ||
-        anchor.closest("[class*='item']") ||
-        anchor.closest("[class*='feed']") ||
-        anchor.closest("[class*='card']") ||
-        anchor.parentElement;
-      const summary = container?.textContent?.trim()?.slice(0, 220) || "";
-      const coverNode = container?.querySelector?.("img, video[poster]");
-      const coverUrl =
-        coverNode?.getAttribute?.("poster") ||
-        coverNode?.currentSrc ||
-        coverNode?.getAttribute?.("src") ||
-        "";
-      items.push({
-        remoteId: url.split("/").filter(Boolean).pop() || url,
-        title,
-        summary,
-        sourceUrl: url,
-        contentType: url.includes("/video/") ? "video" : "article",
-        coverUrl,
-        listHtml: container?.outerHTML || anchor.outerHTML || "",
+  const finalBatch = await readVisibleCards();
+  for (const item of finalBatch) {
+    if (!seen.has(item.sourceUrl)) {
+      seen.set(item.sourceUrl, item);
+      emitProgress(`发现内容 ${seen.size}: ${item.title} ${item.sourceUrl}`, {
+        candidates: seen.size,
+        pageUrl: item.sourceUrl,
+        pageTitle: item.title,
       });
     }
-    return Array.from(new Map(items.map((item) => [item.sourceUrl, item])).values());
-  });
+  }
 
+  const results = Array.from(seen.values());
   return results;
 }
 

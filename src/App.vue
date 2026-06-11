@@ -8,14 +8,13 @@ import {
   chooseDataDirectory,
   diagnosePage,
   getUserProfile,
-  openToutiaoInPanel,
+  launchDebugChrome,
   listSessions,
   listSyncEvents,
   migrateDataDirectory,
   openDownloadDir,
   openItemDir,
   openItemFile,
-  resizeToutiaoPanel,
   searchItemsWithType,
   startSync,
   stopSync,
@@ -40,64 +39,13 @@ const diagnosis = ref<PageDiagnosis | null>(null);
 const loginStatus = ref<LoginStatus | null>(null);
 const settingsOpen = ref(false);
 const error = ref("");
-const leftPaneWidth = ref(0);
-const resizing = ref(false);
 let timer: number | undefined;
-
-const minLeftPaneWidth = 360;
-const minRightPaneWidth = 360;
+let pollTick = 0;
 
 const latestSession = computed(() => sessions.value[0] ?? null);
 const effectiveSessionId = computed(() => selectedSessionId.value || latestSession.value?.id || "");
 const runningSession = computed(() => sessions.value.find((session) => session.status === "running") ?? null);
 const visibleProfile = computed(() => (loginStatus.value?.loggedIn ? profile.value : null));
-
-function clampLeftPaneWidth(width: number) {
-  const windowWidth = window.innerWidth || 1200;
-  const maxLeft = Math.max(minLeftPaneWidth, windowWidth - minRightPaneWidth);
-  return Math.round(Math.min(Math.max(width, minLeftPaneWidth), maxLeft));
-}
-
-async function applySplitWidth(width: number) {
-  const nextWidth = clampLeftPaneWidth(width);
-  leftPaneWidth.value = nextWidth;
-  document.documentElement.style.setProperty("--left-pane-width", `${nextWidth}px`);
-  try {
-    await resizeToutiaoPanel(nextWidth);
-  } catch {
-    // The command is unavailable in browser preview mode; layout still updates locally.
-  }
-}
-
-function handleResizeMove(event: PointerEvent) {
-  if (!resizing.value) {
-    return;
-  }
-  void applySplitWidth(event.clientX);
-}
-
-function stopResize() {
-  if (!resizing.value) {
-    return;
-  }
-  resizing.value = false;
-  document.body.classList.remove("is-resizing");
-  window.removeEventListener("pointermove", handleResizeMove);
-  window.removeEventListener("pointerup", stopResize);
-}
-
-function startResize(event: PointerEvent) {
-  event.preventDefault();
-  resizing.value = true;
-  document.body.classList.add("is-resizing");
-  window.addEventListener("pointermove", handleResizeMove);
-  window.addEventListener("pointerup", stopResize);
-}
-
-function handleWindowResize() {
-  const nextWidth = leftPaneWidth.value || window.innerWidth / 2;
-  void applySplitWidth(nextWidth);
-}
 
 function parseRawJson(item: ContentItem) {
   try {
@@ -133,24 +81,61 @@ function getOriginalLine(item: ContentItem) {
   return text.replace(item.title, "").trim().slice(0, 80);
 }
 
-async function loadAll() {
+function getOriginalCardHtml(item: ContentItem) {
+  const raw = parseRawJson(item);
+  const html = raw?.list?.listHtml || "";
+  if (typeof html !== "string" || !html.trim()) {
+    return "";
+  }
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  doc.querySelectorAll("a[href]").forEach((anchor) => {
+    const href = anchor.getAttribute("href") || "";
+    if (href.startsWith("/")) {
+      anchor.setAttribute("href", `https://www.toutiao.com${href}`);
+    }
+    anchor.setAttribute("target", "_blank");
+    anchor.setAttribute("rel", "noreferrer");
+  });
+  doc.querySelectorAll("img[src]").forEach((image) => {
+    const src = image.getAttribute("src") || "";
+    if (src.startsWith("//")) {
+      image.setAttribute("src", `https:${src}`);
+    }
+  });
+  return doc.body.innerHTML;
+}
+
+async function loadItems() {
+  items.value = await searchItemsWithType(
+    query.value,
+    searchSource.value === "all" ? undefined : searchSource.value,
+    searchContentType.value === "all" ? undefined : searchContentType.value,
+  );
+}
+
+async function loadEvents(sessionId?: string) {
+  events.value = await listSyncEvents(sessionId || effectiveSessionId.value || undefined);
+}
+
+async function loadAll(options?: { includeItems?: boolean; includeEvents?: boolean }) {
+  const includeItems = options?.includeItems ?? true;
+  const includeEvents = options?.includeEvents ?? true;
   loading.value = true;
   error.value = "";
   try {
     bootstrap.value = await bootstrapApp();
     document.title = bootstrap.value.appTitle;
     sessions.value = await listSessions();
-    profile.value = await getUserProfile();
     if (!selectedSessionId.value && sessions.value[0]) {
       selectedSessionId.value = sessions.value[0].id;
     }
-    events.value = await listSyncEvents(effectiveSessionId.value || undefined);
-    items.value = await searchItemsWithType(
-      query.value,
-      searchSource.value === "all" ? undefined : searchSource.value,
-      searchContentType.value === "all" ? undefined : searchContentType.value,
-    );
     syncing.value = sessions.value.some((session) => session.status === "running");
+    if (includeEvents) {
+      await loadEvents();
+    }
+    if (includeItems) {
+      await loadItems();
+    }
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
@@ -158,18 +143,34 @@ async function loadAll() {
   }
 }
 
+function stopPolling() {
+  if (timer) {
+    window.clearInterval(timer);
+    timer = undefined;
+  }
+}
+
+function startPolling() {
+  if (timer) {
+    return;
+  }
+  pollTick = 0;
+  timer = window.setInterval(() => {
+    pollTick += 1;
+    void loadAll({
+      includeEvents: true,
+      includeItems: activeTab.value === "local" || pollTick % 3 === 0,
+    });
+  }, 3000);
+}
+
 async function handleSync() {
   syncing.value = true;
   error.value = "";
   try {
-    await handleCheckLogin();
-    if (!loginStatus.value?.loggedIn) {
-      syncing.value = false;
-      return;
-    }
     const session = await startSync({ source: syncSource.value, mode: "list" });
     selectedSessionId.value = session.id;
-    await loadAll();
+    await loadAll({ includeItems: false, includeEvents: true });
   } catch (err) {
     syncing.value = false;
     error.value = err instanceof Error ? err.message : String(err);
@@ -180,14 +181,9 @@ async function handleDownloadContent() {
   syncing.value = true;
   error.value = "";
   try {
-    await handleCheckLogin();
-    if (!loginStatus.value?.loggedIn) {
-      syncing.value = false;
-      return;
-    }
     const session = await startSync({ source: syncSource.value, mode: "download" });
     selectedSessionId.value = session.id;
-    await loadAll();
+    await loadAll({ includeItems: false, includeEvents: true });
   } catch (err) {
     syncing.value = false;
     error.value = err instanceof Error ? err.message : String(err);
@@ -207,7 +203,7 @@ async function handleStopSync() {
     await stopSync(session.id);
     syncing.value = false;
     selectedSessionId.value = session.id;
-    await loadAll();
+    await loadAll({ includeItems: true, includeEvents: true });
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   }
@@ -226,6 +222,7 @@ async function handleCheckLogin() {
   loginChecking.value = true;
   error.value = "";
   try {
+    await launchDebugChrome();
     loginStatus.value = await checkToutiaoLogin({ source: syncSource.value });
     profile.value = loginStatus.value.loggedIn ? await getUserProfile() : null;
   } catch (err) {
@@ -267,32 +264,10 @@ async function handleMigrateDataDirectory() {
   }
 }
 
-async function handleOpenToutiaoPanel() {
-  error.value = "";
-  try {
-    await openToutiaoInPanel();
-    profile.value = null;
-    loginStatus.value = {
-      loggedIn: false,
-      loginRequired: true,
-      source: syncSource.value,
-      message: "已在右侧打开今日头条，请登录后点击“刷新”",
-    };
-  } catch (err) {
-    error.value = err instanceof Error ? err.message : String(err);
-  }
-}
-
-
-
 async function handleSearch() {
   try {
     activeTab.value = "local";
-    items.value = await searchItemsWithType(
-      query.value,
-      searchSource.value === "all" ? undefined : searchSource.value,
-      searchContentType.value === "all" ? undefined : searchContentType.value,
-    );
+    await loadItems();
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   }
@@ -304,7 +279,7 @@ watch(effectiveSessionId, async (value) => {
     return;
   }
   try {
-    events.value = await listSyncEvents(value);
+    await loadEvents(value);
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   }
@@ -316,20 +291,27 @@ watch(syncSource, () => {
   profile.value = null;
 });
 
+watch(syncing, async (value, oldValue) => {
+  if (value) {
+    startPolling();
+    return;
+  }
+  stopPolling();
+  if (oldValue) {
+    try {
+      await loadItems();
+    } catch (err) {
+      error.value = err instanceof Error ? err.message : String(err);
+    }
+  }
+});
+
 onMounted(async () => {
-  await applySplitWidth(window.innerWidth / 2);
-  window.addEventListener("resize", handleWindowResize);
   await loadAll();
-  await handleCheckLogin();
-  timer = window.setInterval(loadAll, 3000);
 });
 
 onBeforeUnmount(() => {
-  if (timer) {
-    window.clearInterval(timer);
-  }
-  window.removeEventListener("resize", handleWindowResize);
-  stopResize();
+  stopPolling();
 });
 </script>
 
@@ -346,7 +328,6 @@ onBeforeUnmount(() => {
       </button>
       <button v-if="syncing" class="danger" @click="handleStopSync">停止同步</button>
       <button class="secondary" :disabled="syncing" @click="handleDownloadContent">下载内容</button>
-      <button class="secondary" @click="handleOpenToutiaoPanel">打开右侧头条</button>
       <button class="secondary" @click="handleDiagnose">诊断当前页面</button>
       <button class="secondary" @click="activeTab = 'history'">日志</button>
       <div class="toolbar-search">
@@ -360,7 +341,6 @@ onBeforeUnmount(() => {
       <button class="icon-button" aria-label="设置" title="设置" @click="settingsOpen = !settingsOpen">⚙</button>
     </section>
 
-    <div class="left-pane">
     <p v-if="error" class="error">{{ error }}</p>
 
     <section v-if="settingsOpen" class="panel settings-panel">
@@ -383,7 +363,7 @@ onBeforeUnmount(() => {
     <section class="profile-shell">
       <div class="login-status" :class="{ ok: loginStatus?.loggedIn, danger: loginStatus?.loginRequired }">
         <strong>登录状态：{{ loginChecking ? "检查中..." : loginStatus?.loggedIn ? "已登录" : "未登录" }}</strong>
-        <span>{{ loginStatus?.message || "在右栏目登陆后，点击“刷新”检查当前是否已登录今日头条" }}</span>
+        <span>{{ loginStatus?.message || "点击“刷新”会先打开 Chrome，再检查今日头条登录状态" }}</span>
         <button class="status-refresh" type="button" :disabled="loginChecking" @click="handleCheckLogin">
           {{ loginChecking ? "刷新中..." : "刷新" }}
         </button>
@@ -547,50 +527,44 @@ onBeforeUnmount(() => {
         <section v-if="activeTab === 'local'" class="tab-pane">
           <div class="toutiao-list">
             <article v-for="item in items" :key="item.id" class="toutiao-item">
-              <div class="toutiao-body">
+              <div v-if="getOriginalCardHtml(item)" class="toutiao-original-card" v-html="getOriginalCardHtml(item)"></div>
+              <div v-else class="toutiao-body">
                 <h3>{{ item.title }}</h3>
                 <p>{{ getOriginalLine(item) }}</p>
-                <div class="toutiao-meta">
-                  <span>{{ item.downloaded ? "已下载" : "未下载" }}</span>
-                  <span v-if="item.author">{{ item.author }}</span>
-                  <span>{{ item.syncedAt }}</span>
-                  <span>{{ item.source === "favorites" ? "收藏" : "点赞" }}</span>
-                  <span>{{ item.contentType === "video" ? "视频" : "文章" }}</span>
-                  <a :href="item.sourceUrl" target="_blank" rel="noreferrer">原文</a>
-                  <button
-                    v-if="item.articlePath"
-                    class="link-button"
-                    @click="openItemFile(item.id, 'article')"
-                  >
-                    打开文章
-                  </button>
-                  <button
-                    v-if="item.videoPath"
-                    class="link-button"
-                    @click="openItemFile(item.id, 'video')"
-                  >
-                    打开视频
-                  </button>
-                  <button v-if="item.localDir" class="link-button" @click="openItemDir(item.id)">本地目录</button>
-                </div>
               </div>
-              <div v-if="getListImage(item)" class="toutiao-thumb">
+              <div v-if="!getOriginalCardHtml(item) && getListImage(item)" class="toutiao-thumb">
                 <img :src="getListImage(item)" alt="" />
                 <span v-if="item.contentType === 'video'" class="video-mark">▶</span>
+              </div>
+              <div class="toutiao-meta">
+                <span>{{ item.downloaded ? "已下载" : "未下载" }}</span>
+                <span v-if="item.author">{{ item.author }}</span>
+                <span>{{ item.syncedAt }}</span>
+                <span>{{ item.source === "favorites" ? "收藏" : "点赞" }}</span>
+                <span>{{ item.contentType === "video" ? "视频" : "文章" }}</span>
+                <a :href="item.sourceUrl" target="_blank" rel="noreferrer">原文</a>
+                <button
+                  v-if="item.articlePath"
+                  class="link-button"
+                  @click="openItemFile(item.id, 'article')"
+                >
+                  打开文章
+                </button>
+                <button
+                  v-if="item.videoPath"
+                  class="link-button"
+                  @click="openItemFile(item.id, 'video')"
+                >
+                  打开视频
+                </button>
+                <button v-if="item.localDir" class="link-button" @click="openItemDir(item.id)">本地目录</button>
               </div>
             </article>
           </div>
         </section>
       </div>
     </section>
-    </div>
   </main>
-  <div
-    class="split-resizer"
-    :class="{ active: resizing }"
-    title="拖动调整左右栏宽度"
-    @pointerdown="startResize"
-  ></div>
 </template>
 
 <style scoped>

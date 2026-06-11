@@ -51,14 +51,6 @@ export async function launchDebugChrome(): Promise<void> {
   return safeInvoke("launch_debug_chrome");
 }
 
-export async function openToutiaoInPanel(): Promise<void> {
-  return safeInvoke("open_toutiao_in_panel");
-}
-
-export async function resizeToutiaoPanel(leftWidth: number): Promise<void> {
-  return safeInvoke("resize_toutiao_panel", { leftWidth });
-}
-
 export async function diagnosePage(request: DiagnosePageRequest): Promise<PageDiagnosis> {
   return safeInvoke("diagnose_page", { request });
 }

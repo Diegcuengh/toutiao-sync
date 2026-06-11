@@ -209,6 +209,7 @@ async fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> R
                 if let Some(value) = downloaded_value {
                     downloaded = value;
                 }
+                println!("[sync] {}", message);
                 db::update_session_progress(
                     &conn,
                     &session.id,
@@ -225,6 +226,7 @@ async fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> R
             }
             ScriptEvent::Item { item } => {
                 let synced_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                println!("[item] {} {}", item.title, item.source_url);
                 db::upsert_item(&conn, &session.source, &item, &synced_at)?;
                 saved += 1;
                 if item.downloaded {
@@ -246,6 +248,7 @@ async fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> R
                 db::insert_sync_event(&conn, &session.id, "info", &message)?;
             }
             ScriptEvent::Profile { profile } => {
+                println!("[profile] {}", profile.name);
                 db::upsert_user_profile(&conn, &profile)?;
                 db::insert_sync_event(&conn, &session.id, "info", "已更新用户资料")?;
             }
