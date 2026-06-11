@@ -50,6 +50,8 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
           article_path TEXT,
           video_path TEXT,
           local_dir TEXT,
+          list_order INTEGER,
+          list_run_id TEXT,
           raw_json TEXT NOT NULL DEFAULT '{}',
           synced_at TEXT NOT NULL,
           UNIQUE(source, remote_id)
@@ -76,6 +78,8 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
     ensure_column(&conn, "sync_sessions", "total_skipped", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(&conn, "content_items", "content_text", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(&conn, "content_items", "cover_path", "TEXT")?;
+    ensure_column(&conn, "content_items", "list_order", "INTEGER")?;
+    ensure_column(&conn, "content_items", "list_run_id", "TEXT")?;
     Ok(conn)
 }
 
@@ -327,9 +331,9 @@ pub fn upsert_item(conn: &Connection, source: &str, item: &ScriptItem, synced_at
     conn.execute(
         r#"
         INSERT INTO content_items
-          (remote_id, source, title, summary, content_text, author, content_type, source_url, cover_url, cover_path, article_path, video_path, local_dir, raw_json, synced_at)
+          (remote_id, source, title, summary, content_text, author, content_type, source_url, cover_url, cover_path, article_path, video_path, local_dir, list_order, list_run_id, raw_json, synced_at)
         VALUES
-          (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+          (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
         ON CONFLICT(source, remote_id) DO UPDATE SET
           title = excluded.title,
           summary = excluded.summary,
@@ -342,6 +346,8 @@ pub fn upsert_item(conn: &Connection, source: &str, item: &ScriptItem, synced_at
           article_path = COALESCE(excluded.article_path, content_items.article_path),
           video_path = COALESCE(excluded.video_path, content_items.video_path),
           local_dir = COALESCE(excluded.local_dir, content_items.local_dir),
+          list_order = COALESCE(excluded.list_order, content_items.list_order),
+          list_run_id = COALESCE(excluded.list_run_id, content_items.list_run_id),
           raw_json = excluded.raw_json,
           synced_at = excluded.synced_at
         "#,
@@ -359,6 +365,8 @@ pub fn upsert_item(conn: &Connection, source: &str, item: &ScriptItem, synced_at
             item.article_path,
             item.video_path,
             item.local_dir,
+            item.list_order,
+            item.list_run_id,
             item.raw.to_string(),
             synced_at
         ],
@@ -394,6 +402,28 @@ pub fn search_items(
     if let Some(source_value) = source.filter(|value| !value.trim().is_empty()) {
         sql.push_str(" AND source = ?");
         binds.push(source_value.to_string());
+        sql.push_str(
+            r#"
+            AND (
+              list_run_id = (
+                SELECT latest.list_run_id
+                FROM content_items latest
+                WHERE latest.source = ?
+                  AND latest.list_run_id IS NOT NULL
+                ORDER BY latest.synced_at DESC, latest.list_order ASC
+                LIMIT 1
+              )
+              OR NOT EXISTS (
+                SELECT 1
+                FROM content_items latest
+                WHERE latest.source = ?
+                  AND latest.list_run_id IS NOT NULL
+              )
+            )
+            "#,
+        );
+        binds.push(source_value.to_string());
+        binds.push(source_value.to_string());
     }
 
     if let Some(content_type_value) = content_type.filter(|value| !value.trim().is_empty()) {
@@ -401,7 +431,11 @@ pub fn search_items(
         binds.push(content_type_value.to_string());
     }
 
-    sql.push_str(" ORDER BY synced_at DESC LIMIT 200");
+    if source.is_some() {
+        sql.push_str(" ORDER BY CASE WHEN list_order IS NULL THEN 1 ELSE 0 END, list_order ASC, synced_at DESC LIMIT 200");
+    } else {
+        sql.push_str(" ORDER BY synced_at DESC LIMIT 200");
+    }
 
     let mut stmt = conn.prepare(&sql)?;
     let params = rusqlite::params_from_iter(binds.iter());

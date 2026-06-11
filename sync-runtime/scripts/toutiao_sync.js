@@ -351,8 +351,18 @@ async function inspectCurrentPage(page, source) {
   await page.waitForTimeout(400);
   const info = await page.evaluate((currentSource) => {
     const CONTENT_LINK_PATTERN = /\/(article|video|w)\//;
-    const getCardNodes = () =>
-      Array.from(document.querySelectorAll(".main-wrapper .main-l div.profile-wtt-card-wrapper"));
+    const getCardNodes = () => {
+      const feed = document.querySelector(".profile-tab-feed");
+      if (!feed) return [];
+      const cards = Array.from(feed.querySelectorAll("[class*='card-wrapper']"))
+        .filter((element) => {
+          const className = typeof element.className === "string" ? element.className : "";
+          if (!/card-wrapper/.test(className)) return false;
+          const parentCard = element.parentElement?.closest("[class*='card-wrapper']");
+          return !parentCard || !feed.contains(parentCard);
+        });
+      return cards.length ? cards : Array.from(feed.children);
+    };
     const getCardAnchors = (cards) =>
       cards.flatMap((card) =>
         Array.from(card.querySelectorAll("a[href]"))
@@ -551,6 +561,33 @@ function buildSourceListUrl(baseUrl, source) {
   return parsed.toString();
 }
 
+async function resetAllScrollToTop(page) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await page.evaluate(() => {
+      window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+      const candidates = [
+        document.scrollingElement,
+        document.documentElement,
+        document.body,
+        document.querySelector(".main-wrapper"),
+        document.querySelector(".main-l"),
+        ...Array.from(document.querySelectorAll("div")).filter((element) => {
+          const style = window.getComputedStyle(element);
+          return (
+            element.scrollHeight > element.clientHeight + 80 &&
+            /(auto|scroll|overlay)/.test(`${style.overflowY} ${style.overflow}`)
+          );
+        }),
+      ].filter(Boolean);
+      for (const element of new Set(candidates)) {
+        element.scrollTop = 0;
+        element.scrollLeft = 0;
+      }
+    });
+    await page.waitForTimeout(500);
+  }
+}
+
 function isOnTargetList(info, source) {
   const activeTab = info.activeTab || "";
   if (source === "favorites") {
@@ -588,18 +625,139 @@ function assertPageLooksRight(info, source) {
   }
 }
 
-async function collectList(page) {
+async function collectList(page, options = {}) {
+  const onDiscovered = typeof options.onDiscovered === "function" ? options.onDiscovered : null;
   await page.bringToFront();
-  await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" }));
+  await resetAllScrollToTop(page);
   await page.waitForTimeout(1200);
 
   const readVisibleCards = async () =>
     page.evaluate(() => {
       const TITLE_TEXT_BLACKLIST = /^(分享|评论|点赞|收藏|喜欢|更多信息|全部|微头条|书架)$/;
       const CONTENT_LINK_PATTERN = /\/(article|video|w)\//;
-      const cardNodes = Array.from(document.querySelectorAll(".main-wrapper .main-l div.profile-wtt-card-wrapper"));
+      const STYLE_PROPS = [
+        "display",
+        "box-sizing",
+        "position",
+        "inset",
+        "top",
+        "right",
+        "bottom",
+        "left",
+        "float",
+        "clear",
+        "width",
+        "min-width",
+        "max-width",
+        "height",
+        "min-height",
+        "max-height",
+        "margin",
+        "margin-top",
+        "margin-right",
+        "margin-bottom",
+        "margin-left",
+        "padding",
+        "padding-top",
+        "padding-right",
+        "padding-bottom",
+        "padding-left",
+        "border",
+        "border-top",
+        "border-right",
+        "border-bottom",
+        "border-left",
+        "border-radius",
+        "box-shadow",
+        "overflow",
+        "overflow-x",
+        "overflow-y",
+        "font-family",
+        "font-size",
+        "font-weight",
+        "font-style",
+        "line-height",
+        "letter-spacing",
+        "text-align",
+        "text-decoration",
+        "text-overflow",
+        "white-space",
+        "word-break",
+        "color",
+        "background",
+        "background-color",
+        "background-image",
+        "background-position",
+        "background-repeat",
+        "background-size",
+        "opacity",
+        "visibility",
+        "object-fit",
+        "object-position",
+        "vertical-align",
+        "align-items",
+        "justify-content",
+        "gap",
+        "flex",
+        "flex-direction",
+        "flex-wrap",
+        "transform",
+        "z-index",
+        "-webkit-box-orient",
+        "-webkit-line-clamp",
+      ];
+      const inlineComputedStyles = (source) => {
+        const clone = source.cloneNode(true);
+        const sourceNodes = [source, ...source.querySelectorAll("*")];
+        const cloneNodes = [clone, ...clone.querySelectorAll("*")];
+        sourceNodes.forEach((node, index) => {
+          const target = cloneNodes[index];
+          if (!(node instanceof Element) || !(target instanceof Element)) return;
+          const computed = window.getComputedStyle(node);
+          const cssText = STYLE_PROPS
+            .map((prop) => {
+              const value = computed.getPropertyValue(prop);
+              return value ? `${prop}:${value}` : "";
+            })
+            .filter(Boolean)
+            .join(";");
+          if (cssText) {
+            target.setAttribute("style", `${target.getAttribute("style") || ""};${cssText}`);
+          }
+          if (target instanceof HTMLAnchorElement) {
+            target.setAttribute("target", "_blank");
+            target.setAttribute("rel", "noreferrer");
+          }
+        });
+        clone
+          .querySelectorAll(".actions-list-wrapper, .profile-feed-card-tools-actions, .qrcode-panel")
+          .forEach((element) => element.remove());
+        clone.querySelectorAll("*").forEach((element) => {
+          const text = (element.textContent || "").replace(/\s+/g, "").trim();
+          if (text === "取消收藏") {
+            element.remove();
+          }
+        });
+        return clone.outerHTML;
+      };
+      const getCardNodes = () => {
+        const feed = document.querySelector(".profile-tab-feed");
+        if (!feed) return [];
+        const cards = Array.from(feed.querySelectorAll("[class*='card-wrapper']"))
+          .filter((element) => {
+            const className = typeof element.className === "string" ? element.className : "";
+            if (!/card-wrapper/.test(className)) return false;
+            const parentCard = element.parentElement?.closest("[class*='card-wrapper']");
+            return !parentCard || !feed.contains(parentCard);
+          });
+        return cards.length ? cards : Array.from(feed.children);
+      };
+      const cardNodes = getCardNodes();
       const items = [];
       for (const card of cardNodes) {
+        const rect = card.getBoundingClientRect();
+        if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue;
+        const scrollTop = window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
         const anchors = Array.from(card.querySelectorAll("a[href]"));
         const anchor = anchors.find((candidate) => {
           const href = candidate.href || "";
@@ -629,15 +787,22 @@ async function collectList(page) {
           "";
         items.push({
           remoteId: url.split("/").filter(Boolean).pop() || url,
+          absoluteTop: scrollTop + rect.top,
+          visualTop: rect.top,
+          visualBottom: rect.bottom,
           title,
           summary,
           sourceUrl: url,
           contentType: url.includes("/video/") ? "video" : "article",
           coverUrl,
-          listHtml: card.outerHTML || anchor.outerHTML || "",
+          listHtml: inlineComputedStyles(card) || card.outerHTML || anchor.outerHTML || "",
         });
       }
-      return Array.from(new Map(items.map((item) => [item.sourceUrl, item])).values());
+      return Array.from(new Map(
+        items
+          .sort((left, right) => left.absoluteTop - right.absoluteTop || left.visualTop - right.visualTop || left.visualBottom - right.visualBottom)
+          .map((item) => [item.sourceUrl, item]),
+      ).values());
     });
 
   const scrollListPage = async () => {
@@ -655,7 +820,19 @@ async function collectList(page) {
       await page.waitForTimeout(180);
     }
     return page.evaluate(() => {
-      const cards = Array.from(document.querySelectorAll(".main-wrapper .main-l div.profile-wtt-card-wrapper"));
+      const getCardNodes = (root = document) => {
+        const feed = root.querySelector?.(".profile-tab-feed") || (root.matches?.(".profile-tab-feed") ? root : null);
+        if (!feed) return [];
+        const cards = Array.from(feed.querySelectorAll("[class*='card-wrapper']"))
+          .filter((element) => {
+            const className = typeof element.className === "string" ? element.className : "";
+            if (!/card-wrapper/.test(className)) return false;
+            const parentCard = element.parentElement?.closest("[class*='card-wrapper']");
+            return !parentCard || !feed.contains(parentCard);
+          });
+        return cards.length ? cards : Array.from(feed.children);
+      };
+      const cards = getCardNodes();
       const viewportStep = Math.max(650, Math.floor(window.innerHeight * 0.65));
       const rawContainers = [
         document.scrollingElement,
@@ -685,7 +862,7 @@ async function collectList(page) {
       const primary = beforeStates
         .map((state) => ({
           ...state,
-          cardCount: state.element.querySelectorAll?.(".profile-wtt-card-wrapper").length || 0,
+          cardCount: getCardNodes(state.element).length || 0,
           width: state.element.getBoundingClientRect?.().width || window.innerWidth,
         }))
         .filter((state) => state.max > 0)
@@ -762,12 +939,14 @@ async function collectList(page) {
     const beforeSize = seen.size;
     for (const item of batch) {
       if (!seen.has(item.sourceUrl)) {
-        seen.set(item.sourceUrl, item);
-        emitProgress(`发现内容 ${seen.size}: ${item.title} ${item.sourceUrl}`, {
+        const orderedItem = { ...item, listOrder: seen.size + 1 };
+        seen.set(item.sourceUrl, orderedItem);
+        emitProgress(`发现内容 ${seen.size}: ${orderedItem.title} ${orderedItem.sourceUrl}`, {
           candidates: seen.size,
-          pageUrl: item.sourceUrl,
-          pageTitle: item.title,
+          pageUrl: orderedItem.sourceUrl,
+          pageTitle: orderedItem.title,
         });
+        onDiscovered?.(orderedItem, seen.size);
       }
     }
     const scrollInfo = await scrollListPage();
@@ -775,12 +954,14 @@ async function collectList(page) {
     const afterScrollBatch = await readVisibleCards();
     for (const item of afterScrollBatch) {
       if (!seen.has(item.sourceUrl)) {
-        seen.set(item.sourceUrl, item);
-        emitProgress(`发现内容 ${seen.size}: ${item.title} ${item.sourceUrl}`, {
+        const orderedItem = { ...item, listOrder: seen.size + 1 };
+        seen.set(item.sourceUrl, orderedItem);
+        emitProgress(`发现内容 ${seen.size}: ${orderedItem.title} ${orderedItem.sourceUrl}`, {
           candidates: seen.size,
-          pageUrl: item.sourceUrl,
-          pageTitle: item.title,
+          pageUrl: orderedItem.sourceUrl,
+          pageTitle: orderedItem.title,
         });
+        onDiscovered?.(orderedItem, seen.size);
       }
     }
     if (seen.size === beforeSize) {
@@ -810,12 +991,14 @@ async function collectList(page) {
   const finalBatch = await readVisibleCards();
   for (const item of finalBatch) {
     if (!seen.has(item.sourceUrl)) {
-      seen.set(item.sourceUrl, item);
-      emitProgress(`发现内容 ${seen.size}: ${item.title} ${item.sourceUrl}`, {
+      const orderedItem = { ...item, listOrder: seen.size + 1 };
+      seen.set(item.sourceUrl, orderedItem);
+      emitProgress(`发现内容 ${seen.size}: ${orderedItem.title} ${orderedItem.sourceUrl}`, {
         candidates: seen.size,
-        pageUrl: item.sourceUrl,
-        pageTitle: item.title,
+        pageUrl: orderedItem.sourceUrl,
+        pageTitle: orderedItem.title,
       });
+      onDiscovered?.(orderedItem, seen.size);
     }
   }
 
@@ -893,6 +1076,8 @@ function listItemToScriptItem(job, item) {
   const coverUrl = resolveAssetUrl(item.coverUrl, item.sourceUrl);
   return {
     remote_id: canonicalRemoteId(item),
+    list_order: Number.isFinite(item.listOrder) ? item.listOrder : null,
+    list_run_id: job.sessionId || job.session_id || null,
     title: item.title,
     summary: textToSummary(item.summary),
     content_text: "",
@@ -908,6 +1093,8 @@ function listItemToScriptItem(job, item) {
     raw: {
       list: item,
       listOnly: true,
+      listOrder: Number.isFinite(item.listOrder) ? item.listOrder : null,
+      listRunId: job.sessionId || job.session_id || null,
       source: job.source,
     },
   };
@@ -1113,13 +1300,37 @@ async function main() {
   }
   assertPageLooksRight(pageInfo, job.source);
 
+  const normalizedListUrl = normalizeSourceListUrl(page.url(), job.source);
+  emitProgress(`重新载入${job.source === "likes" ? "喜欢" : "收藏"}列表顶部：${normalizedListUrl}`, {
+    pageUrl: pageInfo.url,
+    pageTitle: pageInfo.title,
+  });
+  await page.goto(normalizedListUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
+  await page.waitForTimeout(2500);
+  await resetAllScrollToTop(page);
+  pageInfo = await inspectCurrentPage(page, job.source);
+  assertPageLooksRight(pageInfo, job.source);
+
   const profile = await collectProfile(page);
   if (profile.name || profile.avatarUrl) {
     emit({ type: "profile", profile });
   }
 
+  let streamedListSaved = 0;
+  const streamedListUrls = new Set();
   emitProgress(`扫描当前今日头条${job.source === "likes" ? "喜欢" : "收藏"}页面`);
-  const list = await collectList(page);
+  const list = await collectList(page, {
+    onDiscovered: isListMode
+      ? (item) => {
+          if (streamedListUrls.has(item.sourceUrl)) {
+            return;
+          }
+          streamedListUrls.add(item.sourceUrl);
+          streamedListSaved += 1;
+          emit({ type: "item", item: listItemToScriptItem(job, item) });
+        }
+      : null,
+  });
   if (!list.length) {
     throw new Error(buildNoResultError(pageInfo, job.source));
   }
@@ -1142,9 +1353,13 @@ async function main() {
   const candidates = isDownloadMode
     ? filterDownloadCandidates(list, job.knownRemoteIds)
     : filterIncrementalCandidates(list, job.knownRemoteIds);
-  const skipped = list.length - candidates.length;
-  const selectedCandidates = isVerifyMode ? candidates.slice(0, verifyLimit) : candidates;
-  emitProgress(`${isDownloadMode ? "待下载" : "识别到"} ${list.length} 条候选内容，跳过 ${skipped} 条，${isDownloadMode ? "待下载" : "新增"} ${candidates.length} 条`, {
+  const selectedCandidates = isVerifyMode
+    ? candidates.slice(0, verifyLimit)
+    : isListMode
+      ? list
+      : candidates;
+  const skipped = isListMode ? 0 : list.length - candidates.length;
+  emitProgress(`${isDownloadMode ? "待下载" : "识别到"} ${list.length} 条候选内容，跳过 ${skipped} 条，${isListMode ? "刷新列表" : isDownloadMode ? "待下载" : "新增"} ${selectedCandidates.length} 条`, {
     candidates: list.length,
     skipped,
     discovered: selectedCandidates.length,
@@ -1161,14 +1376,9 @@ async function main() {
   }
 
   if (isListMode) {
-    let saved = 0;
-    for (const item of selectedCandidates) {
-      saved += 1;
-      emit({ type: "item", item: listItemToScriptItem(job, item) });
-    }
     emit({
       type: "done",
-      summary: { candidates: list.length, skipped, discovered: selectedCandidates.length, saved, downloaded: 0 },
+      summary: { candidates: list.length, skipped, discovered: selectedCandidates.length, saved: streamedListSaved, downloaded: 0 },
     });
     await browser.close();
     return;

@@ -114,6 +114,10 @@ pub struct ContentItem {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ScriptItem {
     pub remote_id: String,
+    #[serde(default)]
+    pub list_order: Option<i64>,
+    #[serde(default)]
+    pub list_run_id: Option<String>,
     pub title: String,
     pub summary: String,
     pub content_text: String,

@@ -57,8 +57,8 @@ pub fn spawn_sync(state: AppState, session: SyncSession) -> Result<(), AppError>
     };
     fs::write(&job_path, serde_json::to_vec_pretty(&job)?)?;
 
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = run_sync(state.clone(), session.clone(), job_path).await {
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = run_sync(state.clone(), session.clone(), job_path) {
             let finished_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
             if let Ok(db_path) = state.db_path() {
                 if let Ok(conn) = db::connect(&db_path) {
@@ -142,7 +142,7 @@ pub fn check_login_status(state: &AppState, source: &str) -> Result<LoginStatus,
     result
 }
 
-async fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> Result<(), AppError> {
+fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> Result<(), AppError> {
     let script_path = state.script_path.clone();
     if !script_path.exists() {
         return Err(AppError::Message(format!(

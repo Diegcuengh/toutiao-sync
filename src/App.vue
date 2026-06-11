@@ -41,11 +41,27 @@ const settingsOpen = ref(false);
 const error = ref("");
 let timer: number | undefined;
 let pollTick = 0;
+let refreshInFlight = false;
+let lastItemRefreshAt = 0;
+const ITEM_REFRESH_INTERVAL_MS = 5_000;
+const originalHtmlCache = new Map<string, string>();
 
 const latestSession = computed(() => sessions.value[0] ?? null);
 const effectiveSessionId = computed(() => selectedSessionId.value || latestSession.value?.id || "");
 const runningSession = computed(() => sessions.value.find((session) => session.status === "running") ?? null);
 const visibleProfile = computed(() => (loginStatus.value?.loggedIn ? profile.value : null));
+const canSync = computed(() => Boolean(loginStatus.value?.loggedIn) && !loginChecking.value && !syncing.value);
+const renderedItems = computed(() =>
+  items.value.map((item) => {
+    const originalHtml = getOriginalCardHtml(item);
+    return {
+      item,
+      originalHtml,
+      originalLine: originalHtml ? "" : getOriginalLine(item),
+      listImage: originalHtml ? "" : getListImage(item),
+    };
+  }),
+);
 
 function parseRawJson(item: ContentItem) {
   try {
@@ -82,9 +98,15 @@ function getOriginalLine(item: ContentItem) {
 }
 
 function getOriginalCardHtml(item: ContentItem) {
+  const cacheKey = `${item.id}:${item.syncedAt}:${item.rawJson.length}`;
+  const cached = originalHtmlCache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
   const raw = parseRawJson(item);
   const html = raw?.list?.listHtml || "";
   if (typeof html !== "string" || !html.trim()) {
+    originalHtmlCache.set(cacheKey, "");
     return "";
   }
   const doc = new DOMParser().parseFromString(html, "text/html");
@@ -102,7 +124,40 @@ function getOriginalCardHtml(item: ContentItem) {
       image.setAttribute("src", `https:${src}`);
     }
   });
-  return doc.body.innerHTML;
+  doc
+    .querySelectorAll(".actions-list-wrapper, .profile-feed-card-tools-actions, .qrcode-panel")
+    .forEach((element) => element.remove());
+  doc.querySelectorAll("*").forEach((element) => {
+    const text = (element.textContent || "").replace(/\s+/g, "").trim();
+    if (text === "取消收藏") {
+      element.remove();
+    }
+  });
+  doc
+    .querySelectorAll(".left-tools:empty, .right-tools:empty, .feed-card-footer-cmp:empty")
+    .forEach((element) => element.remove());
+  const footerTarget =
+    doc.querySelector(".feed-card-footer-cmp .left-tools") ||
+    doc.querySelector(".feed-card-footer-cmp .right-tools") ||
+    doc.querySelector(".feed-card-footer-cmp");
+  if (footerTarget) {
+    const localMeta = doc.createElement("span");
+    localMeta.className = "local-sync-meta";
+    localMeta.textContent = [
+      item.downloaded ? "已下载" : "未下载",
+      item.contentType === "video" ? "视频" : "文章",
+    ].join("  ");
+    footerTarget.appendChild(localMeta);
+  }
+  const normalizedHtml = doc.body.innerHTML;
+  originalHtmlCache.set(cacheKey, normalizedHtml);
+  if (originalHtmlCache.size > 300) {
+    const firstKey = originalHtmlCache.keys().next().value;
+    if (firstKey) {
+      originalHtmlCache.delete(firstKey);
+    }
+  }
+  return normalizedHtml;
 }
 
 async function loadItems() {
@@ -111,6 +166,7 @@ async function loadItems() {
     searchSource.value === "all" ? undefined : searchSource.value,
     searchContentType.value === "all" ? undefined : searchContentType.value,
   );
+  lastItemRefreshAt = Date.now();
 }
 
 async function loadEvents(sessionId?: string) {
@@ -118,6 +174,10 @@ async function loadEvents(sessionId?: string) {
 }
 
 async function loadAll(options?: { includeItems?: boolean; includeEvents?: boolean }) {
+  if (refreshInFlight) {
+    return;
+  }
+  refreshInFlight = true;
   const includeItems = options?.includeItems ?? true;
   const includeEvents = options?.includeEvents ?? true;
   loading.value = true;
@@ -140,6 +200,7 @@ async function loadAll(options?: { includeItems?: boolean; includeEvents?: boole
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
     loading.value = false;
+    refreshInFlight = false;
   }
 }
 
@@ -157,14 +218,20 @@ function startPolling() {
   pollTick = 0;
   timer = window.setInterval(() => {
     pollTick += 1;
+    const shouldRefreshItems =
+      activeTab.value === "local" &&
+      Date.now() - lastItemRefreshAt >= ITEM_REFRESH_INTERVAL_MS;
     void loadAll({
       includeEvents: true,
-      includeItems: activeTab.value === "local" || pollTick % 3 === 0,
+      includeItems: shouldRefreshItems,
     });
-  }, 3000);
+  }, 2000);
 }
 
 async function handleSync() {
+  if (!canSync.value) {
+    return;
+  }
   syncing.value = true;
   error.value = "";
   try {
@@ -178,6 +245,9 @@ async function handleSync() {
 }
 
 async function handleDownloadContent() {
+  if (!canSync.value) {
+    return;
+  }
   syncing.value = true;
   error.value = "";
   try {
@@ -323,11 +393,11 @@ onBeforeUnmount(() => {
         <option value="favorites">同步收藏</option>
         <option value="likes">同步喜欢</option>
       </select>
-      <button :disabled="syncing" @click="handleSync">
+      <button :disabled="!canSync" @click="handleSync">
         {{ syncing ? "同步中..." : "同步列表" }}
       </button>
       <button v-if="syncing" class="danger" @click="handleStopSync">停止同步</button>
-      <button class="secondary" :disabled="syncing" @click="handleDownloadContent">下载内容</button>
+      <button class="secondary" :disabled="!canSync" @click="handleDownloadContent">下载内容</button>
       <button class="secondary" @click="handleDiagnose">诊断当前页面</button>
       <button class="secondary" @click="activeTab = 'history'">日志</button>
       <div class="toolbar-search">
@@ -526,38 +596,38 @@ onBeforeUnmount(() => {
 
         <section v-if="activeTab === 'local'" class="tab-pane">
           <div class="toutiao-list">
-            <article v-for="item in items" :key="item.id" class="toutiao-item">
-              <div v-if="getOriginalCardHtml(item)" class="toutiao-original-card" v-html="getOriginalCardHtml(item)"></div>
+            <article v-for="entry in renderedItems" :key="entry.item.id" class="toutiao-item">
+              <div v-if="entry.originalHtml" class="toutiao-original-card" v-html="entry.originalHtml"></div>
               <div v-else class="toutiao-body">
-                <h3>{{ item.title }}</h3>
-                <p>{{ getOriginalLine(item) }}</p>
+                <h3>{{ entry.item.title }}</h3>
+                <p>{{ entry.originalLine }}</p>
               </div>
-              <div v-if="!getOriginalCardHtml(item) && getListImage(item)" class="toutiao-thumb">
-                <img :src="getListImage(item)" alt="" />
-                <span v-if="item.contentType === 'video'" class="video-mark">▶</span>
+              <div v-if="!entry.originalHtml && entry.listImage" class="toutiao-thumb">
+                <img :src="entry.listImage" alt="" />
+                <span v-if="entry.item.contentType === 'video'" class="video-mark">▶</span>
               </div>
-              <div class="toutiao-meta">
-                <span>{{ item.downloaded ? "已下载" : "未下载" }}</span>
-                <span v-if="item.author">{{ item.author }}</span>
-                <span>{{ item.syncedAt }}</span>
-                <span>{{ item.source === "favorites" ? "收藏" : "点赞" }}</span>
-                <span>{{ item.contentType === "video" ? "视频" : "文章" }}</span>
-                <a :href="item.sourceUrl" target="_blank" rel="noreferrer">原文</a>
+              <div
+                v-if="!entry.originalHtml || entry.item.articlePath || entry.item.videoPath || entry.item.localDir"
+                class="toutiao-meta"
+              >
+                <span>{{ entry.item.downloaded ? "已下载" : "未下载" }}</span>
+                <span v-if="entry.item.author">{{ entry.item.author }}</span>
+                <span>{{ entry.item.contentType === "video" ? "视频" : "文章" }}</span>
                 <button
-                  v-if="item.articlePath"
+                  v-if="entry.item.articlePath"
                   class="link-button"
-                  @click="openItemFile(item.id, 'article')"
+                  @click="openItemFile(entry.item.id, 'article')"
                 >
                   打开文章
                 </button>
                 <button
-                  v-if="item.videoPath"
+                  v-if="entry.item.videoPath"
                   class="link-button"
-                  @click="openItemFile(item.id, 'video')"
+                  @click="openItemFile(entry.item.id, 'video')"
                 >
                   打开视频
                 </button>
-                <button v-if="item.localDir" class="link-button" @click="openItemDir(item.id)">本地目录</button>
+                <button v-if="entry.item.localDir" class="link-button" @click="openItemDir(entry.item.id)">本地目录</button>
               </div>
             </article>
           </div>
