@@ -80,7 +80,101 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
     ensure_column(&conn, "content_items", "cover_path", "TEXT")?;
     ensure_column(&conn, "content_items", "list_order", "INTEGER")?;
     ensure_column(&conn, "content_items", "list_run_id", "TEXT")?;
+    migrate_legacy_remote_ids(&conn)?;
     Ok(conn)
+}
+
+fn canonical_remote_id_from_url(source_url: &str, fallback_type: &str, remote_id: &str) -> Option<String> {
+    for kind in ["article", "video", "w"] {
+        let marker = format!("/{kind}/");
+        if let Some(start) = source_url.find(&marker) {
+            let rest = &source_url[start + marker.len()..];
+            let id = rest
+                .split(|character| character == '/' || character == '?' || character == '#')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !id.is_empty() {
+                return Some(format!("{kind}:{id}"));
+            }
+        }
+    }
+
+    if remote_id.chars().all(|character| character.is_ascii_digit()) {
+        let kind = if fallback_type == "video" { "video" } else { "article" };
+        return Some(format!("{kind}:{remote_id}"));
+    }
+
+    None
+}
+
+fn migrate_legacy_remote_ids(conn: &Connection) -> Result<(), AppError> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, source, remote_id, source_url, content_type
+        FROM content_items
+        WHERE remote_id NOT LIKE '%:%'
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+
+    let mut migrations = Vec::new();
+    for row in rows {
+        let (id, source, remote_id, source_url, content_type) = row?;
+        if !remote_id.chars().all(|character| character.is_ascii_digit()) {
+            continue;
+        }
+        if let Some(canonical_id) = canonical_remote_id_from_url(&source_url, &content_type, &remote_id) {
+            if canonical_id != remote_id {
+                migrations.push((id, source, canonical_id));
+            }
+        }
+    }
+    drop(stmt);
+
+    for (id, source, canonical_id) in migrations {
+        let existing_id = conn
+            .query_row(
+                "SELECT id FROM content_items WHERE source = ?1 AND remote_id = ?2 AND id <> ?3 LIMIT 1",
+                params![&source, &canonical_id, id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+
+        if let Some(existing_id) = existing_id {
+            conn.execute(
+                r#"
+                UPDATE content_items
+                SET cover_path = COALESCE(cover_path, (SELECT cover_path FROM content_items WHERE id = ?2)),
+                    article_path = COALESCE(article_path, (SELECT article_path FROM content_items WHERE id = ?2)),
+                    video_path = COALESCE(video_path, (SELECT video_path FROM content_items WHERE id = ?2)),
+                    local_dir = COALESCE(local_dir, (SELECT local_dir FROM content_items WHERE id = ?2)),
+                    content_text = CASE
+                      WHEN content_text = '' THEN COALESCE((SELECT content_text FROM content_items WHERE id = ?2), '')
+                      ELSE content_text
+                    END
+                WHERE id = ?1
+                "#,
+                params![existing_id, id],
+            )?;
+            conn.execute("DELETE FROM content_items WHERE id = ?1", params![id])?;
+        } else {
+            conn.execute(
+                "UPDATE content_items SET remote_id = ?1 WHERE id = ?2",
+                params![canonical_id, id],
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 pub fn upsert_user_profile(conn: &Connection, profile: &UserProfile) -> Result<(), AppError> {

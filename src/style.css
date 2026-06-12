@@ -587,12 +587,17 @@ a {
   box-sizing: border-box !important;
   height: auto !important;
   min-height: 0 !important;
-  max-height: 56px !important;
+  max-height: 64px !important;
+  line-height: 32px !important;
   overflow: hidden !important;
   text-overflow: ellipsis !important;
   white-space: normal !important;
   -webkit-box-orient: vertical !important;
   -webkit-line-clamp: 2 !important;
+}
+
+.toutiao-original-card .title {
+  margin-bottom: 12px !important;
 }
 
 .toutiao-original-card .feed-card-footer-cmp button {

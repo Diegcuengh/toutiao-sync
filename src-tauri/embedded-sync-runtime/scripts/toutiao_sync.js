@@ -191,8 +191,9 @@ async function connectChrome(job) {
 function normalizeUrl(url) {
   try {
     const parsed = new URL(url);
+    parsed.hash = "";
     parsed.search = "";
-    return parsed.toString();
+    return parsed.toString().replace(/\/$/, "");
   } catch {
     return url;
   }
@@ -217,7 +218,41 @@ function resolveAssetUrl(url, baseUrl) {
 }
 
 function canonicalRemoteId(item) {
-  return String(item.remoteId || normalizeUrl(item.sourceUrl));
+  const rawRemoteId = String(item.remoteId || "").trim();
+  if (/^(article|video|w):[^:]+$/.test(rawRemoteId)) {
+    return rawRemoteId;
+  }
+  try {
+    const parsed = new URL(item.sourceUrl || rawRemoteId);
+    const match = parsed.pathname.match(/\/(article|video|w)\/([^/?#]+)/);
+    if (match?.[1] && match?.[2]) {
+      return `${match[1]}:${match[2]}`;
+    }
+  } catch {
+    // fall back below
+  }
+  if (/^\d+$/.test(rawRemoteId) && item.contentType) {
+    return `${item.contentType === "video" ? "video" : "article"}:${rawRemoteId}`;
+  }
+  return rawRemoteId || normalizeUrl(item.sourceUrl);
+}
+
+function legacyRemoteIds(item) {
+  const legacyIds = new Set();
+  const rawRemoteId = String(item.remoteId || "").trim();
+  if (rawRemoteId) {
+    legacyIds.add(rawRemoteId);
+  }
+  try {
+    const parsed = new URL(item.sourceUrl || "");
+    const match = parsed.pathname.match(/\/(article|video|w)\/([^/?#]+)/);
+    if (match?.[2]) {
+      legacyIds.add(match[2]);
+    }
+  } catch {
+    // ignore invalid URLs
+  }
+  return legacyIds;
 }
 
 function stableLocalId(item) {
@@ -1105,7 +1140,7 @@ function filterIncrementalCandidates(list, knownRemoteIds) {
   return list.filter((item) => {
     const canonicalId = canonicalRemoteId(item);
     const legacyId = hashText(canonicalId);
-    return !knownSet.has(canonicalId) && !knownSet.has(legacyId);
+    return !knownSet.has(canonicalId) && !knownSet.has(legacyId) && !Array.from(legacyRemoteIds(item)).some((id) => knownSet.has(id));
   });
 }
 
@@ -1114,7 +1149,10 @@ function filterDownloadCandidates(list, targetRemoteIds) {
   if (!targetSet.size) {
     return [];
   }
-  return list.filter((item) => targetSet.has(canonicalRemoteId(item)) || targetSet.has(hashText(canonicalRemoteId(item))));
+  return list.filter((item) => {
+    const canonicalId = canonicalRemoteId(item);
+    return targetSet.has(canonicalId) || targetSet.has(hashText(canonicalId)) || Array.from(legacyRemoteIds(item)).some((id) => targetSet.has(id));
+  });
 }
 
 function listItemToScriptItem(job, item) {
