@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
     error::AppError,
-    models::{ContentItem, ScriptItem, SyncEvent, SyncSession, UserProfile},
+    models::{ContentItem, ScriptItem, SyncEvent, SyncSession, TagOption, UserProfile},
 };
 
 pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
@@ -71,6 +71,24 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
         CREATE INDEX IF NOT EXISTS idx_content_items_title ON content_items(title);
         CREATE INDEX IF NOT EXISTS idx_content_items_synced_at ON content_items(synced_at DESC);
         CREATE INDEX IF NOT EXISTS idx_sync_events_session_id ON sync_events(session_id);
+
+        CREATE TABLE IF NOT EXISTS content_item_tags (
+          item_id INTEGER NOT NULL,
+          tag TEXT NOT NULL,
+          source TEXT NOT NULL DEFAULT 'auto',
+          created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+          UNIQUE(item_id, tag)
+        );
+
+        CREATE TABLE IF NOT EXISTS content_item_tag_blocks (
+          item_id INTEGER NOT NULL,
+          tag TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+          UNIQUE(item_id, tag)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_content_item_tags_item_id ON content_item_tags(item_id);
+        CREATE INDEX IF NOT EXISTS idx_content_item_tags_tag ON content_item_tags(tag);
         "#,
     )?;
 
@@ -81,7 +99,115 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
     ensure_column(&conn, "content_items", "list_order", "INTEGER")?;
     ensure_column(&conn, "content_items", "list_run_id", "TEXT")?;
     migrate_legacy_remote_ids(&conn)?;
+    classify_existing_items(&conn)?;
     Ok(conn)
+}
+
+const DEFAULT_TAGS: [&str; 9] = ["IT", "编程", "运动", "医学", "文化", "壮族", "语言", "汉族", "基因"];
+
+fn tag_rules(tag: &str) -> &'static [&'static str] {
+    match tag {
+        "IT" => &[
+            "it", "ai", "codex", "github", "redis", "pdf", "html", "markdown", "wps", "软件", "开源", "工具",
+            "电脑", "微软", "程序", "token", "数据库", "vue", "api",
+        ],
+        "编程" => &[
+            "编程", "代码", "程序员", "rust", "python", "javascript", "redis", "github", "开源", "源码", "api",
+            "开发", "框架",
+        ],
+        "运动" => &["运动", "训练", "膝盖", "肌肉", "康复", "腿", "跑", "健身", "臀", "动作"],
+        "医学" => &["医学", "医生", "治疗", "健康", "康复", "疾病", "血管", "膝", "药", "医院"],
+        "文化" => &["文化", "历史", "民族", "语言", "汉语", "壮族", "汉族", "民俗", "传统"],
+        "壮族" => &["壮族", "壮话", "壮语"],
+        "语言" => &["语言", "汉语", "英语", "口语", "普通话", "方言", "词汇", "词汇量"],
+        "汉族" => &["汉族", "皇汉", "汉人"],
+        "基因" => &["基因", "dna", "血统", "染色体"],
+        _ => &[],
+    }
+}
+
+fn normalize_tag(tag: &str) -> String {
+    tag.trim().trim_matches('#').trim().to_string()
+}
+
+fn classify_text_tags(text: &str) -> Vec<String> {
+    let haystack = text.to_lowercase();
+    DEFAULT_TAGS
+        .iter()
+        .filter(|tag| tag_rules(tag).iter().any(|keyword| haystack.contains(&keyword.to_lowercase())))
+        .map(|tag| (*tag).to_string())
+        .collect()
+}
+
+fn insert_auto_tags(conn: &Connection, item_id: i64, tags: &[String]) -> Result<(), AppError> {
+    for tag in tags {
+        let tag = normalize_tag(tag);
+        if tag.is_empty() {
+            continue;
+        }
+        conn.execute(
+            r#"
+            INSERT OR IGNORE INTO content_item_tags (item_id, tag, source)
+            SELECT ?1, ?2, 'auto'
+            WHERE NOT EXISTS (
+              SELECT 1 FROM content_item_tag_blocks WHERE item_id = ?1 AND tag = ?2
+            )
+            "#,
+            params![item_id, tag],
+        )?;
+    }
+    Ok(())
+}
+
+fn classify_item_by_id(conn: &Connection, item_id: i64) -> Result<(), AppError> {
+    let Some((title, summary, content_text, author, source_url, raw_json)) = conn
+        .query_row(
+            r#"
+            SELECT title, summary, content_text, author, source_url, raw_json
+            FROM content_items
+            WHERE id = ?1
+            "#,
+            [item_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()? else {
+        return Ok(());
+    };
+
+    let text = format!("{title}\n{summary}\n{content_text}\n{author}\n{source_url}\n{raw_json}");
+    insert_auto_tags(conn, item_id, &classify_text_tags(&text))
+}
+
+fn classify_existing_items(conn: &Connection) -> Result<(), AppError> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id
+        FROM content_items
+        WHERE NOT EXISTS (
+          SELECT 1 FROM content_item_tags WHERE item_id = content_items.id
+        )
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+    let mut item_ids = Vec::new();
+    for row in rows {
+        item_ids.push(row?);
+    }
+    drop(stmt);
+
+    for item_id in item_ids {
+        classify_item_by_id(conn, item_id)?;
+    }
+    Ok(())
 }
 
 fn canonical_remote_id_from_url(source_url: &str, fallback_type: &str, remote_id: &str) -> Option<String> {
@@ -465,6 +591,12 @@ pub fn upsert_item(conn: &Connection, source: &str, item: &ScriptItem, synced_at
             synced_at
         ],
     )?;
+    let item_id = conn.query_row(
+        "SELECT id FROM content_items WHERE source = ?1 AND remote_id = ?2",
+        params![source, &item.remote_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    classify_item_by_id(conn, item_id)?;
     Ok(())
 }
 
@@ -473,12 +605,19 @@ pub fn search_items(
     query: &str,
     source: Option<&str>,
     content_type: Option<&str>,
+    tag_filters: &[String],
 ) -> Result<Vec<ContentItem>, AppError> {
     let keyword = format!("%{}%", query.trim());
     let mut sql = String::from(
         r#"
         SELECT id, remote_id, source, title, summary, content_text, author, content_type, source_url, cover_url, cover_path, article_path, video_path, local_dir, synced_at, raw_json,
-               CASE WHEN article_path IS NOT NULL OR video_path IS NOT NULL THEN 1 ELSE 0 END AS downloaded
+               CASE WHEN article_path IS NOT NULL OR video_path IS NOT NULL THEN 1 ELSE 0 END AS downloaded,
+               COALESCE((
+                 SELECT GROUP_CONCAT(tag, '||')
+                 FROM content_item_tags tag_items
+                 WHERE tag_items.item_id = content_items.id
+                 ORDER BY tag
+               ), '') AS tags
         FROM content_items
         WHERE 1 = 1
         "#,
@@ -526,6 +665,23 @@ pub fn search_items(
         binds.push(content_type_value.to_string());
     }
 
+    let clean_tag_filters = tag_filters
+        .iter()
+        .map(|tag| normalize_tag(tag))
+        .filter(|tag| !tag.is_empty())
+        .collect::<Vec<_>>();
+    if !clean_tag_filters.is_empty() {
+        sql.push_str(" AND EXISTS (SELECT 1 FROM content_item_tags filter_tags WHERE filter_tags.item_id = content_items.id AND filter_tags.tag IN (");
+        for index in 0..clean_tag_filters.len() {
+            if index > 0 {
+                sql.push_str(", ");
+            }
+            sql.push('?');
+        }
+        sql.push_str("))");
+        binds.extend(clean_tag_filters);
+    }
+
     if source.is_some() {
         sql.push_str(" ORDER BY CASE WHEN list_order IS NULL THEN 1 ELSE 0 END, list_order ASC, synced_at DESC LIMIT 200");
     } else {
@@ -553,6 +709,13 @@ pub fn search_items(
             synced_at: row.get(14)?,
             raw_json: row.get(15)?,
             downloaded: row.get::<_, i64>(16)? == 1,
+            tags: row
+                .get::<_, String>(17)?
+                .split("||")
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .map(ToString::to_string)
+                .collect(),
         })
     })?;
 
@@ -561,6 +724,136 @@ pub fn search_items(
         items.push(row?);
     }
     Ok(items)
+}
+
+fn latest_source_filter_sql(source: Option<&str>) -> (String, Vec<String>) {
+    let Some(source_value) = source.filter(|value| !value.trim().is_empty()) else {
+        return (String::new(), Vec::new());
+    };
+    (
+        r#"
+        AND content_items.source = ?
+        AND (
+          content_items.list_run_id = (
+            SELECT latest.list_run_id
+            FROM content_items latest
+            WHERE latest.source = ?
+              AND latest.list_run_id IS NOT NULL
+            ORDER BY latest.synced_at DESC, latest.list_order ASC
+            LIMIT 1
+          )
+          OR NOT EXISTS (
+            SELECT 1
+            FROM content_items latest
+            WHERE latest.source = ?
+              AND latest.list_run_id IS NOT NULL
+          )
+        )
+        "#.to_string(),
+        vec![source_value.to_string(), source_value.to_string(), source_value.to_string()],
+    )
+}
+
+pub fn list_tag_options(conn: &Connection, source: Option<&str>) -> Result<Vec<TagOption>, AppError> {
+    let (source_sql, source_binds) = latest_source_filter_sql(source);
+    let total_sql = format!("SELECT COUNT(*) FROM content_items WHERE 1 = 1 {source_sql}");
+    let total = conn.query_row(&total_sql, rusqlite::params_from_iter(source_binds.iter()), |row| row.get::<_, i64>(0))?;
+
+    let mut options = vec![TagOption { name: "所有".to_string(), count: total }];
+    for (name, content_type) in [("视频", "video"), ("文章", "article")] {
+        let (source_sql, mut binds) = latest_source_filter_sql(source);
+        let sql = format!("SELECT COUNT(*) FROM content_items WHERE 1 = 1 {source_sql} AND content_type = ?");
+        binds.push(content_type.to_string());
+        let count = conn.query_row(&sql, rusqlite::params_from_iter(binds.iter()), |row| row.get::<_, i64>(0))?;
+        options.push(TagOption { name: name.to_string(), count });
+    }
+
+    let (source_sql, binds) = latest_source_filter_sql(source);
+    let sql = format!(
+        r#"
+        SELECT tag_items.tag, COUNT(*) AS count
+        FROM content_item_tags tag_items
+        JOIN content_items ON content_items.id = tag_items.item_id
+        WHERE 1 = 1
+        {source_sql}
+        GROUP BY tag_items.tag
+        ORDER BY count DESC, tag_items.tag ASC
+        "#
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(binds.iter()), |row| {
+        Ok(TagOption {
+            name: row.get(0)?,
+            count: row.get(1)?,
+        })
+    })?;
+
+    let mut existing_names = options.iter().map(|option| option.name.clone()).collect::<Vec<_>>();
+    for tag in DEFAULT_TAGS {
+        if !existing_names.iter().any(|name| name == tag) {
+            options.push(TagOption { name: tag.to_string(), count: 0 });
+            existing_names.push(tag.to_string());
+        }
+    }
+    for row in rows {
+        let option = row?;
+        if !existing_names.iter().any(|name| name == &option.name) {
+            existing_names.push(option.name.clone());
+            options.push(option);
+        } else if let Some(existing) = options.iter_mut().find(|item| item.name == option.name) {
+            existing.count = option.count;
+        }
+    }
+    Ok(options)
+}
+
+pub fn add_item_tag(conn: &Connection, item_id: i64, tag: &str) -> Result<Vec<String>, AppError> {
+    let tag = normalize_tag(tag);
+    if tag.is_empty() {
+        return Err(AppError::Message("标签不能为空".into()));
+    }
+    conn.execute(
+        "DELETE FROM content_item_tag_blocks WHERE item_id = ?1 AND tag = ?2",
+        params![item_id, &tag],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO content_item_tags (item_id, tag, source) VALUES (?1, ?2, 'manual')",
+        params![item_id, &tag],
+    )?;
+    list_item_tags(conn, item_id)
+}
+
+pub fn remove_item_tag(conn: &Connection, item_id: i64, tag: &str) -> Result<Vec<String>, AppError> {
+    let tag = normalize_tag(tag);
+    if tag.is_empty() {
+        return list_item_tags(conn, item_id);
+    }
+    conn.execute(
+        "DELETE FROM content_item_tags WHERE item_id = ?1 AND tag = ?2",
+        params![item_id, &tag],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO content_item_tag_blocks (item_id, tag) VALUES (?1, ?2)",
+        params![item_id, &tag],
+    )?;
+    list_item_tags(conn, item_id)
+}
+
+pub fn list_item_tags(conn: &Connection, item_id: i64) -> Result<Vec<String>, AppError> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT tag
+        FROM content_item_tags
+        WHERE item_id = ?1
+        ORDER BY tag ASC
+        "#,
+    )?;
+    let rows = stmt.query_map([item_id], |row| row.get::<_, String>(0))?;
+    let mut tags = Vec::new();
+    for row in rows {
+        tags.push(row?);
+    }
+    Ok(tags)
 }
 
 pub fn get_item_dir(conn: &Connection, item_id: i64) -> Result<Option<String>, AppError> {

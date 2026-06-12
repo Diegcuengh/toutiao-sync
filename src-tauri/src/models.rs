@@ -109,6 +109,14 @@ pub struct ContentItem {
     pub synced_at: String,
     pub downloaded: bool,
     pub raw_json: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagOption {
+    pub name: String,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1441,11 +1441,12 @@ async function main() {
     : isListMode
       ? list
       : candidates;
-  const skipped = isListMode ? 0 : list.length - candidates.length;
+  const skipped = list.length - candidates.length;
+  const discovered = isListMode ? candidates.length : selectedCandidates.length;
   emitProgress(`${isDownloadMode ? "待下载" : "识别到"} ${list.length} 条候选内容，跳过 ${skipped} 条，${isListMode ? "刷新列表" : isDownloadMode ? "待下载" : "新增"} ${selectedCandidates.length} 条`, {
     candidates: list.length,
     skipped,
-    discovered: selectedCandidates.length,
+    discovered,
     saved: 0,
     downloaded: 0,
     pageUrl: pageInfo.url,
@@ -1461,7 +1462,7 @@ async function main() {
   if (isListMode) {
     emit({
       type: "done",
-      summary: { candidates: list.length, skipped, discovered: selectedCandidates.length, saved: streamedListSaved, downloaded: 0 },
+      summary: { candidates: list.length, skipped, discovered, saved: streamedListSaved, downloaded: 0 },
     });
     await browser.close();
     return;

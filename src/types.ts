@@ -82,6 +82,12 @@ export interface ContentItem {
   syncedAt: string;
   downloaded: boolean;
   rawJson: string;
+  tags: string[];
+}
+
+export interface TagOption {
+  name: string;
+  count: number;
 }
 
 export interface UserProfile {

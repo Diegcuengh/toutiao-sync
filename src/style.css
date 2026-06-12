@@ -260,6 +260,44 @@ a {
   min-width: 760px;
 }
 
+.tag-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  min-width: 760px;
+  padding: 14px 0 10px;
+  border-bottom: 1px solid #eef0f4;
+  background: #ffffff;
+}
+
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  background: #ffffff;
+  color: #334155;
+  font-size: 14px;
+}
+
+.tag-chip small {
+  color: #94a3b8;
+  font-size: 12px;
+}
+
+.tag-chip.active {
+  border-color: #ef4444;
+  background: #fff1f2;
+  color: #ef4444;
+}
+
+.tag-chip.active small {
+  color: #f87171;
+}
+
 .site-tab {
   height: 66px;
   padding: 0;
@@ -575,6 +613,62 @@ a {
   display: block;
   padding: 0;
   border-bottom: 1px solid #f3f4f6;
+}
+
+.item-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 0 0 12px;
+  color: #64748b;
+  font-size: 13px;
+}
+
+.item-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: #f1f5f9;
+  color: #475569;
+  font-size: 13px;
+}
+
+.item-tag span {
+  color: #94a3b8;
+}
+
+.tag-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tag-add input {
+  width: 92px;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 13px;
+}
+
+.tag-add button {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: #ffffff;
+  border: 1px solid #d1d5db;
+  color: #475569;
+  font-size: 13px;
+}
+
+.empty-state {
+  margin: 0;
+  padding: 28px 0;
+  color: #94a3b8;
 }
 
 .toutiao-original-card {

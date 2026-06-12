@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import appLogo from "./assets/logo.png";
 import defaultAvatar from "./assets/default-avatar.svg";
 import {
+  addItemTag,
   bootstrapApp,
   checkToutiaoLogin,
   chooseDataDirectory,
@@ -11,29 +12,33 @@ import {
   launchDebugChrome,
   listSessions,
   listSyncEvents,
+  listTags,
   migrateDataDirectory,
   openDownloadDir,
   openItemDir,
   openItemFile,
+  removeItemTag,
   searchItemsWithType,
   startSync,
   stopSync,
 } from "./lib/api";
-import type { AppBootstrap, ContentItem, ContentTypeFilter, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncSource, UserProfile } from "./types";
+import type { AppBootstrap, ContentItem, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncSource, TagOption, UserProfile } from "./types";
 
 const bootstrap = ref<AppBootstrap | null>(null);
 const sessions = ref<SyncSession[]>([]);
 const events = ref<SyncEvent[]>([]);
 const items = ref<ContentItem[]>([]);
+const tagOptions = ref<TagOption[]>([]);
 const profile = ref<UserProfile | null>(null);
 const query = ref("");
+const selectedTags = ref<string[]>([]);
+const tagDrafts = ref<Record<number, string>>({});
 const loading = ref(false);
 const syncing = ref(false);
 const loginChecking = ref(false);
 const activeTab = ref<"history" | "logs" | "local">("local");
 const syncSource = ref<SyncSource>("favorites");
 const searchSource = ref<"all" | SyncSource>("favorites");
-const searchContentType = ref<ContentTypeFilter>("all");
 const selectedSessionId = ref<string>("");
 const diagnosis = ref<PageDiagnosis | null>(null);
 const loginStatus = ref<LoginStatus | null>(null);
@@ -52,6 +57,14 @@ const effectiveSessionId = computed(() => selectedSessionId.value || latestSessi
 const runningSession = computed(() => sessions.value.find((session) => session.status === "running") ?? null);
 const visibleProfile = computed(() => (loginStatus.value?.loggedIn ? profile.value : null));
 const canSync = computed(() => Boolean(loginStatus.value?.loggedIn) && !loginChecking.value && !syncing.value);
+const semanticTagFilters = computed(() => selectedTags.value.filter((tag) => !["所有", "视频", "文章"].includes(tag)));
+const contentTypeFilter = computed(() => {
+  const wantsVideo = selectedTags.value.includes("视频");
+  const wantsArticle = selectedTags.value.includes("文章");
+  if (wantsVideo && !wantsArticle) return "video";
+  if (wantsArticle && !wantsVideo) return "article";
+  return undefined;
+});
 const renderedItems = computed(() =>
   items.value.map((item) => {
     const originalHtml = getOriginalCardHtml(item);
@@ -186,9 +199,14 @@ async function loadItems() {
   items.value = await searchItemsWithType(
     query.value,
     source,
-    searchContentType.value === "all" ? undefined : searchContentType.value,
+    contentTypeFilter.value,
+    semanticTagFilters.value,
   );
   lastItemRefreshAt = Date.now();
+}
+
+async function loadTagOptions() {
+  tagOptions.value = await listTags(searchSource.value === "all" ? undefined : searchSource.value);
 }
 
 async function loadEvents(sessionId?: string) {
@@ -216,6 +234,7 @@ async function loadAll(options?: { includeItems?: boolean; includeEvents?: boole
       await loadEvents();
     }
     if (includeItems) {
+      await loadTagOptions();
       await loadItems();
     }
   } catch (err) {
@@ -360,7 +379,60 @@ async function handleSearch() {
   error.value = "";
   try {
     activeTab.value = "local";
+    await loadTagOptions();
     await loadItems();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
+function toggleTag(tag: string) {
+  if (tag === "所有") {
+    selectedTags.value = [];
+    void handleSearch();
+    return;
+  }
+  const selected = new Set(selectedTags.value);
+  if (selected.has(tag)) {
+    selected.delete(tag);
+  } else {
+    selected.add(tag);
+  }
+  selectedTags.value = Array.from(selected);
+  void handleSearch();
+}
+
+function selectSearchSource(source: "all" | SyncSource) {
+  activeTab.value = "local";
+  searchSource.value = source;
+  selectedTags.value = [];
+  if (source !== "all") {
+    syncSource.value = source;
+  }
+  void handleSearch();
+}
+
+async function handleAddTag(item: ContentItem) {
+  const tag = (tagDrafts.value[item.id] || "").trim();
+  if (!tag) {
+    return;
+  }
+  try {
+    item.tags = await addItemTag(item.id, tag);
+    tagDrafts.value[item.id] = "";
+    await loadTagOptions();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
+async function handleRemoveTag(item: ContentItem, tag: string) {
+  try {
+    item.tags = await removeItemTag(item.id, tag);
+    await loadTagOptions();
+    if (selectedTags.value.includes(tag)) {
+      await loadItems();
+    }
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   }
@@ -390,6 +462,10 @@ watch(syncSource, () => {
   loginStatus.value = null;
   diagnosis.value = null;
   profile.value = null;
+});
+
+watch(searchSource, () => {
+  selectedTags.value = [];
 });
 
 watch(query, () => {
@@ -536,7 +612,7 @@ onBeforeUnmount(() => {
           class="site-tab"
           :class="{ active: activeTab === 'local' && searchSource === 'all' }"
           type="button"
-          @click="activeTab = 'local'; searchSource = 'all'; handleSearch()"
+          @click="selectSearchSource('all')"
         >
           全部
         </button>
@@ -545,7 +621,7 @@ onBeforeUnmount(() => {
           :class="{ active: activeTab === 'local' && searchSource === 'favorites' }"
           role="tab"
           :aria-selected="activeTab === 'local' && searchSource === 'favorites'"
-          @click="activeTab = 'local'; syncSource = 'favorites'; searchSource = 'favorites'; handleSearch()"
+          @click="selectSearchSource('favorites')"
         >
           收藏
         </button>
@@ -554,9 +630,23 @@ onBeforeUnmount(() => {
           :class="{ active: activeTab === 'local' && searchSource === 'likes' }"
           role="tab"
           :aria-selected="activeTab === 'local' && searchSource === 'likes'"
-          @click="activeTab = 'local'; syncSource = 'likes'; searchSource = 'likes'; handleSearch()"
+          @click="selectSearchSource('likes')"
         >
           喜欢
+        </button>
+      </div>
+
+      <div class="tag-filter-bar" aria-label="内容标签筛选">
+        <button
+          v-for="tag in tagOptions"
+          :key="tag.name"
+          class="tag-chip"
+          :class="{ active: tag.name === '所有' ? !selectedTags.length : selectedTags.includes(tag.name) }"
+          type="button"
+          @click="toggleTag(tag.name)"
+        >
+          <span>{{ tag.name }}</span>
+          <small>{{ tag.count }}</small>
         </button>
       </div>
 
@@ -684,7 +774,28 @@ onBeforeUnmount(() => {
                 </button>
                 <button v-if="entry.item.localDir" class="link-button" @click="openItemDir(entry.item.id)">本地目录</button>
               </div>
+              <div class="item-tags">
+                <button
+                  v-for="tag in entry.item.tags"
+                  :key="`${entry.item.id}-${tag}`"
+                  class="item-tag"
+                  type="button"
+                  title="点击删除标签"
+                  @click="handleRemoveTag(entry.item, tag)"
+                >
+                  {{ tag }} <span>×</span>
+                </button>
+                <form class="tag-add" @submit.prevent="handleAddTag(entry.item)">
+                  <input
+                    v-model="tagDrafts[entry.item.id]"
+                    type="text"
+                    placeholder="添加标签"
+                  />
+                  <button type="submit">添加</button>
+                </form>
+              </div>
             </article>
+            <p v-if="!renderedItems.length" class="empty-state">暂无内容</p>
           </div>
         </section>
       </div>

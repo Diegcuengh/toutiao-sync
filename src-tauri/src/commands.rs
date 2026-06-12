@@ -11,7 +11,7 @@ use crate::{
     build_info,
     db,
     error::AppError,
-    models::{AppBootstrap, ContentItem, DiagnosePageRequest, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest, UserProfile},
+    models::{AppBootstrap, ContentItem, DiagnosePageRequest, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest, TagOption, UserProfile},
     sync,
 };
 
@@ -136,10 +136,11 @@ pub fn search_items(
     query: String,
     source: Option<String>,
     content_type: Option<String>,
+    tag_filters: Option<Vec<String>>,
 ) -> Result<Vec<ContentItem>, AppError> {
     log_command("search_items");
     let conn = db::connect(&state.db_path()?)?;
-    db::search_items(&conn, &query, source.as_deref(), content_type.as_deref())
+    db::search_items(&conn, &query, source.as_deref(), content_type.as_deref(), tag_filters.as_deref().unwrap_or(&[]))
 }
 
 #[tauri::command]
@@ -147,6 +148,27 @@ pub fn get_user_profile(state: State<'_, AppState>) -> Result<Option<UserProfile
     log_command("get_user_profile");
     let conn = db::connect(&state.db_path()?)?;
     db::get_user_profile(&conn)
+}
+
+#[tauri::command]
+pub fn list_tags(state: State<'_, AppState>, source: Option<String>) -> Result<Vec<TagOption>, AppError> {
+    log_command("list_tags");
+    let conn = db::connect(&state.db_path()?)?;
+    db::list_tag_options(&conn, source.as_deref())
+}
+
+#[tauri::command]
+pub fn add_item_tag(state: State<'_, AppState>, item_id: i64, tag: String) -> Result<Vec<String>, AppError> {
+    log_command("add_item_tag");
+    let conn = db::connect(&state.db_path()?)?;
+    db::add_item_tag(&conn, item_id, &tag)
+}
+
+#[tauri::command]
+pub fn remove_item_tag(state: State<'_, AppState>, item_id: i64, tag: String) -> Result<Vec<String>, AppError> {
+    log_command("remove_item_tag");
+    let conn = db::connect(&state.db_path()?)?;
+    db::remove_item_tag(&conn, item_id, &tag)
 }
 
 #[tauri::command]

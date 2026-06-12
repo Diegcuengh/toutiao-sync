@@ -1,5 +1,5 @@
 ﻿import { invoke } from "@tauri-apps/api/core";
-import type { AppBootstrap, ContentItem, DiagnosePageRequest, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest, UserProfile } from "../types";
+import type { AppBootstrap, ContentItem, DiagnosePageRequest, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest, TagOption, UserProfile } from "../types";
 
 function hasTauriRuntime() {
   if (typeof window === "undefined") {
@@ -26,6 +26,11 @@ export async function bootstrapApp(): Promise<AppBootstrap> {
       dataDir: "预览模式不可用",
       downloadDir: "预览模式不可用",
       activeSessionIds: [],
+      version: "preview",
+      buildDate: "",
+      buildTime: "",
+      buildLabel: "preview",
+      appTitle: "今日头条收藏/喜欢同步 preview",
     };
   }
   return safeInvoke("bootstrap_app");
@@ -81,11 +86,12 @@ export async function searchItemsWithType(
   query: string,
   source?: "favorites" | "likes",
   contentType?: "article" | "video",
+  tagFilters?: string[],
 ): Promise<ContentItem[]> {
   if (!hasTauriRuntime()) {
     return [];
   }
-  return safeInvoke("search_items", { query, source, contentType });
+  return safeInvoke("search_items", { query, source, contentType, tagFilters });
 }
 
 export async function getUserProfile(): Promise<UserProfile | null> {
@@ -93,6 +99,34 @@ export async function getUserProfile(): Promise<UserProfile | null> {
     return null;
   }
   return safeInvoke("get_user_profile");
+}
+
+export async function listTags(source?: "favorites" | "likes"): Promise<TagOption[]> {
+  if (!hasTauriRuntime()) {
+    return [
+      { name: "所有", count: 0 },
+      { name: "视频", count: 0 },
+      { name: "文章", count: 0 },
+      { name: "IT", count: 0 },
+      { name: "编程", count: 0 },
+      { name: "运动", count: 0 },
+      { name: "医学", count: 0 },
+      { name: "文化", count: 0 },
+      { name: "壮族", count: 0 },
+      { name: "语言", count: 0 },
+      { name: "汉族", count: 0 },
+      { name: "基因", count: 0 },
+    ];
+  }
+  return safeInvoke("list_tags", { source });
+}
+
+export async function addItemTag(itemId: number, tag: string): Promise<string[]> {
+  return safeInvoke("add_item_tag", { itemId, tag });
+}
+
+export async function removeItemTag(itemId: number, tag: string): Promise<string[]> {
+  return safeInvoke("remove_item_tag", { itemId, tag });
 }
 
 export async function openDownloadDir(): Promise<void> {
