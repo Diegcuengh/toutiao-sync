@@ -728,6 +728,38 @@ async function collectList(page, options = {}) {
             target.setAttribute("target", "_blank");
             target.setAttribute("rel", "noreferrer");
           }
+          if (node.classList?.contains("share-btn")) {
+            const before = window.getComputedStyle(node, "::before");
+            const beforeBg = before.getPropertyValue("background-image");
+            const beforeContent = before.getPropertyValue("content");
+            if (
+              beforeBg &&
+              beforeBg !== "none" &&
+              beforeContent &&
+              beforeContent !== "none" &&
+              !target.querySelector(":scope > .local-share-before-icon")
+            ) {
+              const icon = document.createElement("i");
+              icon.className = "local-share-before-icon";
+              icon.setAttribute(
+                "style",
+                [
+                  "display:block!important",
+                  "position:absolute!important",
+                  `left:${before.getPropertyValue("left") || "0px"}!important`,
+                  `top:${before.getPropertyValue("top") || "0px"}!important`,
+                  `width:${before.getPropertyValue("width") || "20px"}!important`,
+                  `height:${before.getPropertyValue("height") || "20px"}!important`,
+                  `background-image:${beforeBg}!important`,
+                  `background-position:${before.getPropertyValue("background-position") || "center"}!important`,
+                  `background-repeat:${before.getPropertyValue("background-repeat") || "no-repeat"}!important`,
+                  `background-size:${before.getPropertyValue("background-size") || "20px 20px"}!important`,
+                  "pointer-events:none!important",
+                ].join(";"),
+              );
+              target.prepend(icon);
+            }
+          }
         });
         clone
           .querySelectorAll(".actions-list-wrapper, .profile-feed-card-tools-actions, .qrcode-panel")
@@ -754,29 +786,42 @@ async function collectList(page, options = {}) {
       };
       const cardNodes = getCardNodes();
       const items = [];
+      const normalizeText = (value) => (value || "").replace(/\s+/g, " ").trim();
+      const isUsefulTitle = (value) =>
+        value &&
+        value.length >= 2 &&
+        !TITLE_TEXT_BLACKLIST.test(value) &&
+        !/^\d+\s*(评论|播放|展现|阅读)$/.test(value);
+      const pickTitle = (card, anchor, anchors) => {
+        const preferred = [
+          card.querySelector(".title")?.getAttribute("title") || "",
+          card.querySelector(".title")?.textContent || "",
+          anchor.getAttribute("title") || "",
+          anchor.textContent || "",
+          ...anchors.map((candidate) => candidate.getAttribute("title") || ""),
+        ]
+          .map(normalizeText)
+          .find(isUsefulTitle);
+        if (preferred) return preferred;
+        return [
+          ...anchors.map((candidate) => candidate.textContent || ""),
+          ...Array.from(card.querySelectorAll("h1, h2, h3, h4, strong, p")).map((node) => node.textContent || ""),
+        ]
+          .map(normalizeText)
+          .filter(isUsefulTitle)
+          .sort((left, right) => right.length - left.length)[0] || "";
+      };
       for (const card of cardNodes) {
         const rect = card.getBoundingClientRect();
-        if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue;
         const scrollTop = window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
         const anchors = Array.from(card.querySelectorAll("a[href]"));
         const anchor = anchors.find((candidate) => {
-          const href = candidate.href || "";
+          const href = candidate.href || candidate.getAttribute("href") || "";
           return href.includes("toutiao.com") && CONTENT_LINK_PATTERN.test(href) && !href.includes("#comment");
         });
         if (!anchor) continue;
         const url = anchor.href;
-        const titleCandidates = [
-          anchor.getAttribute("title") || "",
-          anchor.textContent || "",
-          ...anchors.map((candidate) => candidate.getAttribute("title") || ""),
-          ...anchors.map((candidate) => candidate.textContent || ""),
-          ...Array.from(card.querySelectorAll("h1, h2, h3, h4, strong, p, span")).map((node) => node.textContent || ""),
-        ]
-          .map((value) => value.replace(/\s+/g, " ").trim())
-          .filter((value) => value && value.length >= 6 && !TITLE_TEXT_BLACKLIST.test(value) && !/^\d+\s*(评论|播放|展现)$/.test(value));
-        const title =
-          titleCandidates.sort((left, right) => right.length - left.length)[0] ||
-          "";
+        const title = pickTitle(card, anchor, anchors);
         if (!title) continue;
         const summary = card.textContent?.replace(/\s+/g, " ").trim()?.slice(0, 220) || "";
         const coverNode = card.querySelector?.("img, video[poster]");

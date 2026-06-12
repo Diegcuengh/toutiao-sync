@@ -40,6 +40,7 @@ const loginStatus = ref<LoginStatus | null>(null);
 const settingsOpen = ref(false);
 const error = ref("");
 let timer: number | undefined;
+let searchTimer: number | undefined;
 let pollTick = 0;
 let refreshInFlight = false;
 let lastItemRefreshAt = 0;
@@ -133,6 +134,20 @@ function getOriginalCardHtml(item: ContentItem) {
       element.remove();
     }
   });
+  doc.querySelectorAll(".feed-card-footer-share-cmp").forEach((element) => {
+    const shareButton = element.querySelector(".share-btn");
+    if (shareButton) {
+      if (shareButton.querySelector(".local-share-before-icon")) {
+        shareButton.classList.add("has-local-share-icon");
+      }
+      const wrapper = doc.createElement("div");
+      wrapper.className = "ttp-interact-share";
+      wrapper.appendChild(shareButton);
+      element.replaceChildren(wrapper);
+    } else {
+      element.replaceChildren(document.createTextNode("分享"));
+    }
+  });
   doc
     .querySelectorAll(".left-tools:empty, .right-tools:empty, .feed-card-footer-cmp:empty")
     .forEach((element) => element.remove());
@@ -143,10 +158,11 @@ function getOriginalCardHtml(item: ContentItem) {
   if (footerTarget) {
     const localMeta = doc.createElement("span");
     localMeta.className = "local-sync-meta";
-    localMeta.textContent = [
-      item.downloaded ? "已下载" : "未下载",
-      item.contentType === "video" ? "视频" : "文章",
-    ].join("  ");
+    [item.downloaded ? "已下载" : "未下载", item.contentType === "video" ? "视频" : "文章"].forEach((value) => {
+      const metaItem = doc.createElement("span");
+      metaItem.textContent = value;
+      localMeta.appendChild(metaItem);
+    });
     footerTarget.appendChild(localMeta);
   }
   const normalizedHtml = doc.body.innerHTML;
@@ -161,9 +177,15 @@ function getOriginalCardHtml(item: ContentItem) {
 }
 
 async function loadItems() {
+  if (searchSource.value === "all") {
+    items.value = [];
+    lastItemRefreshAt = Date.now();
+    return;
+  }
+  const source = searchSource.value === "likes" ? "likes" : "favorites";
   items.value = await searchItemsWithType(
     query.value,
-    searchSource.value === "all" ? undefined : searchSource.value,
+    source,
     searchContentType.value === "all" ? undefined : searchContentType.value,
   );
   lastItemRefreshAt = Date.now();
@@ -335,12 +357,21 @@ async function handleMigrateDataDirectory() {
 }
 
 async function handleSearch() {
+  error.value = "";
   try {
     activeTab.value = "local";
     await loadItems();
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   }
+}
+
+async function handleClearSearch() {
+  if (!query.value) {
+    return;
+  }
+  query.value = "";
+  await handleSearch();
 }
 
 watch(effectiveSessionId, async (value) => {
@@ -359,6 +390,15 @@ watch(syncSource, () => {
   loginStatus.value = null;
   diagnosis.value = null;
   profile.value = null;
+});
+
+watch(query, () => {
+  if (searchTimer) {
+    window.clearTimeout(searchTimer);
+  }
+  searchTimer = window.setTimeout(() => {
+    handleSearch();
+  }, 250);
 });
 
 watch(syncing, async (value, oldValue) => {
@@ -382,6 +422,9 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   stopPolling();
+  if (searchTimer) {
+    window.clearTimeout(searchTimer);
+  }
 });
 </script>
 
@@ -401,12 +444,26 @@ onBeforeUnmount(() => {
       <button class="secondary" @click="handleDiagnose">诊断当前页面</button>
       <button class="secondary" @click="activeTab = 'history'">日志</button>
       <div class="toolbar-search">
-        <span>⌕</span>
+        <span class="search-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" focusable="false">
+            <path d="M10.8 4.2a6.6 6.6 0 1 0 0 13.2 6.6 6.6 0 0 0 0-13.2Zm-8.6 6.6a8.6 8.6 0 1 1 15.1 5.6l4 4a1.4 1.4 0 0 1-2 2l-4-4A8.6 8.6 0 0 1 2.2 10.8Z" />
+          </svg>
+        </span>
         <input
           v-model="query"
-          placeholder="搜索"
+          placeholder="搜索收藏内容"
           @keyup.enter="handleSearch"
         />
+        <button
+          v-if="query"
+          class="search-clear"
+          type="button"
+          aria-label="清除搜索"
+          title="清除搜索"
+          @click="handleClearSearch"
+        >
+          ×
+        </button>
       </div>
       <button class="icon-button" aria-label="设置" title="设置" @click="settingsOpen = !settingsOpen">⚙</button>
     </section>
@@ -501,8 +558,6 @@ onBeforeUnmount(() => {
         >
           喜欢
         </button>
-        <button class="site-tab spacer" type="button"></button>
-        <button class="site-search" type="button" @click="handleSearch">⌕</button>
       </div>
 
       <div class="content-panel">

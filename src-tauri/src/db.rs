@@ -392,7 +392,8 @@ pub fn search_items(
     let mut binds: Vec<String> = Vec::new();
 
     if !query.trim().is_empty() {
-        sql.push_str(" AND (title LIKE ? OR summary LIKE ? OR content_text LIKE ? OR author LIKE ?)");
+        sql.push_str(" AND (title LIKE ? OR summary LIKE ? OR content_text LIKE ? OR author LIKE ? OR raw_json LIKE ?)");
+        binds.push(keyword.clone());
         binds.push(keyword.clone());
         binds.push(keyword.clone());
         binds.push(keyword.clone());
