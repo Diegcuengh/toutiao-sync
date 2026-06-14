@@ -996,6 +996,8 @@ async function collectList(page, options = {}) {
       const pageClientHeight = Math.max(window.innerHeight || 0, activeState.clientHeight || 0);
       const pageTop = Math.max(afterWindowTop, activeState.afterTop || 0);
       const isAtBottom = pageTop + pageClientHeight >= pageScrollHeight - 40;
+      const bodyText = document.body?.innerText || "";
+      const endMarker = /暂无更多|没有更多|已加载全部|已经到底|到底了|暂无收藏|暂未收藏/.test(bodyText);
       return {
         beforeTop: Math.max(beforeWindowTop, activeState.beforeTop || 0),
         afterTop: pageTop,
@@ -1003,6 +1005,7 @@ async function collectList(page, options = {}) {
         scrollHeight: pageScrollHeight,
         clientHeight: pageClientHeight,
         isAtBottom,
+        endMarker,
         cardCount: cards.length,
         container: `${activeState.tagName}${activeState.className ? `.${activeState.className}` : ""}`,
       };
@@ -1014,7 +1017,7 @@ async function collectList(page, options = {}) {
   let bottomRounds = 0;
   let lastScrollHeight = 0;
 
-  for (let index = 0; index < 80; index += 1) {
+  for (let index = 0; index < 9999999; index += 1) {
     const batch = await readVisibleCards();
     const beforeSize = seen.size;
     for (const item of batch) {
@@ -1056,14 +1059,22 @@ async function collectList(page, options = {}) {
     }
     lastScrollHeight = scrollInfo.scrollHeight;
     emitProgress(
-      `滚动扫描 ${index + 1}：top ${Math.round(scrollInfo.afterTop)}/${Math.round(scrollInfo.scrollHeight)}，移动 ${Math.round(scrollInfo.moved)}，卡片 ${scrollInfo.cardCount}，累计 ${seen.size}，容器 ${scrollInfo.container}`,
+      `滚动扫描 ${index + 1}：top ${Math.round(scrollInfo.afterTop)}/${Math.round(scrollInfo.scrollHeight)}，移动 ${Math.round(scrollInfo.moved)}，卡片 ${scrollInfo.cardCount}，累计 ${seen.size}，容器 ${scrollInfo.container}${scrollInfo.endMarker ? "，已到底" : ""}`,
       {
       candidates: seen.size,
       pageUrl: page.url(),
       pageTitle: await page.title().catch(() => ""),
       },
     );
-    if (bottomRounds >= 3 && stableRounds >= 2) {
+    if (scrollInfo.endMarker && bottomRounds >= 3 && stableRounds >= 2) {
+      break;
+    }
+    if (!scrollInfo.endMarker && bottomRounds >= 200 && stableRounds >= 200) {
+      emitProgress(`连续 ${bottomRounds} 轮接近底部但没有识别到底提示，也没有新增内容，停止扫描`, {
+        candidates: seen.size,
+        pageUrl: page.url(),
+        pageTitle: await page.title().catch(() => ""),
+      });
       break;
     }
   }

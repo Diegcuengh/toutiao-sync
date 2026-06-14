@@ -226,7 +226,7 @@ fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> Result<
             }
             ScriptEvent::Item { item } => {
                 let synced_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                println!("[item] {} {}", item.title, item.source_url);
+                //println!("[item] {} {}", item.title, item.source_url);
                 db::upsert_item(&conn, &session.source, &item, &synced_at)?;
                 saved += 1;
                 if item.downloaded {
