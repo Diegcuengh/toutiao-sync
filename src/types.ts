@@ -85,6 +85,13 @@ export interface ContentItem {
   tags: string[];
 }
 
+export interface PagedContentItems {
+  items: ContentItem[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
 export interface TagOption {
   name: string;
   count: number;

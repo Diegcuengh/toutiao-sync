@@ -33,6 +33,8 @@ const profile = ref<UserProfile | null>(null);
 const query = ref("");
 const selectedTags = ref<string[]>([]);
 const tagDrafts = ref<Record<number, string>>({});
+const currentPage = ref(1);
+const totalItems = ref(0);
 const loading = ref(false);
 const syncing = ref(false);
 const loginChecking = ref(false);
@@ -50,6 +52,7 @@ let pollTick = 0;
 let refreshInFlight = false;
 let lastItemRefreshAt = 0;
 const ITEM_REFRESH_INTERVAL_MS = 5_000;
+const PAGE_SIZE = 50;
 const originalHtmlCache = new Map<string, string>();
 
 const latestSession = computed(() => sessions.value[0] ?? null);
@@ -57,6 +60,9 @@ const effectiveSessionId = computed(() => selectedSessionId.value || latestSessi
 const runningSession = computed(() => sessions.value.find((session) => session.status === "running") ?? null);
 const visibleProfile = computed(() => (loginStatus.value?.loggedIn ? profile.value : null));
 const canSync = computed(() => Boolean(loginStatus.value?.loggedIn) && !loginChecking.value && !syncing.value);
+const pageCount = computed(() => Math.max(1, Math.ceil(totalItems.value / PAGE_SIZE)));
+const pageStart = computed(() => (totalItems.value ? (currentPage.value - 1) * PAGE_SIZE + 1 : 0));
+const pageEnd = computed(() => Math.min(currentPage.value * PAGE_SIZE, totalItems.value));
 const semanticTagFilters = computed(() => selectedTags.value.filter((tag) => !["所有", "视频", "文章"].includes(tag)));
 const contentTypeFilter = computed(() => {
   const wantsVideo = selectedTags.value.includes("视频");
@@ -192,21 +198,36 @@ function getOriginalCardHtml(item: ContentItem) {
 async function loadItems() {
   if (searchSource.value === "all") {
     items.value = [];
+    totalItems.value = 0;
+    currentPage.value = 1;
     lastItemRefreshAt = Date.now();
     return;
   }
   const source = searchSource.value === "likes" ? "likes" : "favorites";
-  items.value = await searchItemsWithType(
+  const result = await searchItemsWithType(
     query.value,
     source,
     contentTypeFilter.value,
     semanticTagFilters.value,
+    currentPage.value,
+    PAGE_SIZE,
   );
+  items.value = result.items;
+  totalItems.value = result.total;
+  if (currentPage.value > pageCount.value) {
+    currentPage.value = pageCount.value;
+    await loadItems();
+    return;
+  }
   lastItemRefreshAt = Date.now();
 }
 
 async function loadTagOptions() {
-  tagOptions.value = await listTags(searchSource.value === "all" ? undefined : searchSource.value);
+  if (searchSource.value === "all") {
+    tagOptions.value = [];
+    return;
+  }
+  tagOptions.value = await listTags(searchSource.value);
 }
 
 async function loadEvents(sessionId?: string) {
@@ -387,6 +408,7 @@ async function handleSearch() {
 }
 
 function toggleTag(tag: string) {
+  currentPage.value = 1;
   if (tag === "所有") {
     selectedTags.value = [];
     void handleSearch();
@@ -406,10 +428,20 @@ function selectSearchSource(source: "all" | SyncSource) {
   activeTab.value = "local";
   searchSource.value = source;
   selectedTags.value = [];
+  currentPage.value = 1;
   if (source !== "all") {
     syncSource.value = source;
   }
   void handleSearch();
+}
+
+async function goToPage(page: number) {
+  const nextPage = Math.min(Math.max(1, page), pageCount.value);
+  if (nextPage === currentPage.value) {
+    return;
+  }
+  currentPage.value = nextPage;
+  await loadItems();
 }
 
 async function handleAddTag(item: ContentItem) {
@@ -443,6 +475,7 @@ async function handleClearSearch() {
     return;
   }
   query.value = "";
+  currentPage.value = 1;
   await handleSearch();
 }
 
@@ -469,6 +502,7 @@ watch(searchSource, () => {
 });
 
 watch(query, () => {
+  currentPage.value = 1;
   if (searchTimer) {
     window.clearTimeout(searchTimer);
   }
@@ -796,6 +830,24 @@ onBeforeUnmount(() => {
               </div>
             </article>
             <p v-if="!renderedItems.length" class="empty-state">暂无内容</p>
+          </div>
+          <div v-if="totalItems > PAGE_SIZE" class="pagination" aria-label="收藏列表分页">
+            <span class="page-summary">第 {{ pageStart }}-{{ pageEnd }} 条 / 共 {{ totalItems }} 条</span>
+            <div class="page-actions">
+              <button class="secondary" type="button" :disabled="currentPage <= 1 || loading" @click="goToPage(1)">
+                首页
+              </button>
+              <button class="secondary" type="button" :disabled="currentPage <= 1 || loading" @click="goToPage(currentPage - 1)">
+                上一页
+              </button>
+              <span class="page-current">{{ currentPage }} / {{ pageCount }}</span>
+              <button class="secondary" type="button" :disabled="currentPage >= pageCount || loading" @click="goToPage(currentPage + 1)">
+                下一页
+              </button>
+              <button class="secondary" type="button" :disabled="currentPage >= pageCount || loading" @click="goToPage(pageCount)">
+                末页
+              </button>
+            </div>
           </div>
         </section>
       </div>

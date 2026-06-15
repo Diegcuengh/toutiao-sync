@@ -114,6 +114,15 @@ pub struct ContentItem {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PagedContentItems {
+    pub items: Vec<ContentItem>,
+    pub total: i64,
+    pub page: i64,
+    pub page_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TagOption {
     pub name: String,
     pub count: i64,

@@ -671,6 +671,37 @@ a {
   color: #94a3b8;
 }
 
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 760px;
+  padding: 18px 0 26px;
+  border-top: 1px solid #f3f4f6;
+  color: #64748b;
+  font-size: 14px;
+}
+
+.page-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.page-actions button {
+  height: 34px;
+  min-width: 62px;
+  padding: 0 12px;
+  border-radius: 10px;
+  font-size: 14px;
+}
+
+.page-current {
+  min-width: 72px;
+  color: #334155;
+  text-align: center;
+}
+
 .toutiao-original-card {
   width: 100%;
 }

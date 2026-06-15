@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
     error::AppError,
-    models::{ContentItem, ScriptItem, SyncEvent, SyncSession, TagOption, UserProfile},
+    models::{ContentItem, PagedContentItems, ScriptItem, SyncEvent, SyncSession, TagOption, UserProfile},
 };
 
 pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
@@ -600,15 +600,63 @@ pub fn upsert_item(conn: &Connection, source: &str, item: &ScriptItem, synced_at
     Ok(())
 }
 
-pub fn search_items(
+pub fn search_items_page(
     conn: &Connection,
     query: &str,
     source: Option<&str>,
     content_type: Option<&str>,
     tag_filters: &[String],
-) -> Result<Vec<ContentItem>, AppError> {
+    page: i64,
+    page_size: i64,
+) -> Result<PagedContentItems, AppError> {
+    let page = page.max(1);
+    let page_size = page_size.clamp(1, 100);
+    let offset = (page - 1) * page_size;
     let keyword = format!("%{}%", query.trim());
-    let mut sql = String::from(
+    let mut where_sql = String::from(" WHERE 1 = 1");
+    let mut binds: Vec<String> = Vec::new();
+    let has_source = source.filter(|value| !value.trim().is_empty()).is_some();
+
+    if !query.trim().is_empty() {
+        where_sql.push_str(" AND (title LIKE ? OR summary LIKE ? OR content_text LIKE ? OR author LIKE ? OR raw_json LIKE ?)");
+        binds.push(keyword.clone());
+        binds.push(keyword.clone());
+        binds.push(keyword.clone());
+        binds.push(keyword.clone());
+        binds.push(keyword);
+    }
+
+    if let Some(source_value) = source.filter(|value| !value.trim().is_empty()) {
+        where_sql.push_str(" AND source = ?");
+        binds.push(source_value.to_string());
+    }
+
+    if let Some(content_type_value) = content_type.filter(|value| !value.trim().is_empty()) {
+        where_sql.push_str(" AND content_type = ?");
+        binds.push(content_type_value.to_string());
+    }
+
+    let clean_tag_filters = tag_filters
+        .iter()
+        .map(|tag| normalize_tag(tag))
+        .filter(|tag| !tag.is_empty())
+        .collect::<Vec<_>>();
+    if !clean_tag_filters.is_empty() {
+        where_sql.push_str(" AND EXISTS (SELECT 1 FROM content_item_tags filter_tags WHERE filter_tags.item_id = content_items.id AND filter_tags.tag IN (");
+        for index in 0..clean_tag_filters.len() {
+            if index > 0 {
+                where_sql.push_str(", ");
+            }
+            where_sql.push('?');
+        }
+        where_sql.push_str("))");
+        binds.extend(clean_tag_filters);
+    }
+
+    let count_sql = format!("SELECT COUNT(*) FROM content_items {where_sql}");
+    let total = conn.query_row(&count_sql, rusqlite::params_from_iter(binds.iter()), |row| row.get::<_, i64>(0))?;
+
+    let mut sql = format!(
         r#"
         SELECT id, remote_id, source, title, summary, content_text, author, content_type, source_url, cover_url, cover_path, article_path, video_path, local_dir, synced_at, raw_json,
                CASE WHEN article_path IS NOT NULL OR video_path IS NOT NULL THEN 1 ELSE 0 END AS downloaded,
@@ -619,74 +667,16 @@ pub fn search_items(
                  ORDER BY tag
                ), '') AS tags
         FROM content_items
-        WHERE 1 = 1
-        "#,
+        {where_sql}
+        "#
     );
-    let mut binds: Vec<String> = Vec::new();
 
-    if !query.trim().is_empty() {
-        sql.push_str(" AND (title LIKE ? OR summary LIKE ? OR content_text LIKE ? OR author LIKE ? OR raw_json LIKE ?)");
-        binds.push(keyword.clone());
-        binds.push(keyword.clone());
-        binds.push(keyword.clone());
-        binds.push(keyword.clone());
-        binds.push(keyword);
-    }
-
-    if let Some(source_value) = source.filter(|value| !value.trim().is_empty()) {
-        sql.push_str(" AND source = ?");
-        binds.push(source_value.to_string());
-        sql.push_str(
-            r#"
-            AND (
-              list_run_id = (
-                SELECT latest.list_run_id
-                FROM content_items latest
-                WHERE latest.source = ?
-                  AND latest.list_run_id IS NOT NULL
-                ORDER BY latest.synced_at DESC, latest.list_order ASC
-                LIMIT 1
-              )
-              OR NOT EXISTS (
-                SELECT 1
-                FROM content_items latest
-                WHERE latest.source = ?
-                  AND latest.list_run_id IS NOT NULL
-              )
-            )
-            "#,
-        );
-        binds.push(source_value.to_string());
-        binds.push(source_value.to_string());
-    }
-
-    if let Some(content_type_value) = content_type.filter(|value| !value.trim().is_empty()) {
-        sql.push_str(" AND content_type = ?");
-        binds.push(content_type_value.to_string());
-    }
-
-    let clean_tag_filters = tag_filters
-        .iter()
-        .map(|tag| normalize_tag(tag))
-        .filter(|tag| !tag.is_empty())
-        .collect::<Vec<_>>();
-    if !clean_tag_filters.is_empty() {
-        sql.push_str(" AND EXISTS (SELECT 1 FROM content_item_tags filter_tags WHERE filter_tags.item_id = content_items.id AND filter_tags.tag IN (");
-        for index in 0..clean_tag_filters.len() {
-            if index > 0 {
-                sql.push_str(", ");
-            }
-            sql.push('?');
-        }
-        sql.push_str("))");
-        binds.extend(clean_tag_filters);
-    }
-
-    if source.is_some() {
-        sql.push_str(" ORDER BY CASE WHEN list_order IS NULL THEN 1 ELSE 0 END, list_order ASC, synced_at DESC LIMIT 200");
+    if has_source {
+        sql.push_str(" ORDER BY synced_at DESC, CASE WHEN list_order IS NULL THEN 1 ELSE 0 END, list_order ASC");
     } else {
-        sql.push_str(" ORDER BY synced_at DESC LIMIT 200");
+        sql.push_str(" ORDER BY synced_at DESC");
     }
+    sql.push_str(&format!(" LIMIT {page_size} OFFSET {offset}"));
 
     let mut stmt = conn.prepare(&sql)?;
     let params = rusqlite::params_from_iter(binds.iter());
@@ -723,7 +713,12 @@ pub fn search_items(
     for row in rows {
         items.push(row?);
     }
-    Ok(items)
+    Ok(PagedContentItems {
+        items,
+        total,
+        page,
+        page_size,
+    })
 }
 
 fn latest_source_filter_sql(source: Option<&str>) -> (String, Vec<String>) {
@@ -731,26 +726,8 @@ fn latest_source_filter_sql(source: Option<&str>) -> (String, Vec<String>) {
         return (String::new(), Vec::new());
     };
     (
-        r#"
-        AND content_items.source = ?
-        AND (
-          content_items.list_run_id = (
-            SELECT latest.list_run_id
-            FROM content_items latest
-            WHERE latest.source = ?
-              AND latest.list_run_id IS NOT NULL
-            ORDER BY latest.synced_at DESC, latest.list_order ASC
-            LIMIT 1
-          )
-          OR NOT EXISTS (
-            SELECT 1
-            FROM content_items latest
-            WHERE latest.source = ?
-              AND latest.list_run_id IS NOT NULL
-          )
-        )
-        "#.to_string(),
-        vec![source_value.to_string(), source_value.to_string(), source_value.to_string()],
+        " AND content_items.source = ? ".to_string(),
+        vec![source_value.to_string()],
     )
 }
 

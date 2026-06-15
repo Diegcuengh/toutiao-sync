@@ -4,3 +4,7 @@ dist
 /vite1421.err
 /vite1421.out
 /vite14321.log
+legal_cases
+.chrome_clone
+.tmp_chrome_dbg
+tmp_docs

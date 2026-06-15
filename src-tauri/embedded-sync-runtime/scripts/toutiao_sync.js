@@ -653,15 +653,19 @@ function assertPageLooksRight(info, source) {
       `当前页面不像“${source === "likes" ? "喜欢" : "收藏"}”列表页。未命中对应关键词；标题：${info.title || "无"}；地址：${info.url}`,
     );
   }
-  if (info.contentAnchorCount === 0) {
-    throw new Error(
-      `当前页面未识别到可同步内容链接。标题：${info.title || "无"}；地址：${info.url}`,
-    );
-  }
+  // 内容链接可能在懒加载后才出现；不要在诊断阶段中断，让后续滚动扫描决定继续或完成。
 }
 
 async function collectList(page, options = {}) {
   const onDiscovered = typeof options.onDiscovered === "function" ? options.onDiscovered : null;
+  const knownRemoteIds = options.knownRemoteIds || options.known_remote_ids || [];
+  const knownSet = new Set((knownRemoteIds || []).map((item) => String(item)));
+  const stopOnKnownDuplicate = options.stopOnKnownDuplicate !== false && knownSet.size > 0;
+  const isKnownItem = (item) => {
+    const canonicalId = canonicalRemoteId(item);
+    const legacyId = hashText(canonicalId);
+    return knownSet.has(canonicalId) || knownSet.has(legacyId) || Array.from(legacyRemoteIds(item)).some((id) => knownSet.has(id));
+  };
   await page.bringToFront();
   await resetAllScrollToTop(page);
   await page.waitForTimeout(1200);
@@ -1016,43 +1020,61 @@ async function collectList(page, options = {}) {
   let stableRounds = 0;
   let bottomRounds = 0;
   let lastScrollHeight = 0;
+  let stopReason = "";
+
+  const addDiscoveredItem = (item) => {
+    if (seen.has(item.sourceUrl)) {
+      return "seen";
+    }
+    if (stopOnKnownDuplicate && isKnownItem(item)) {
+      stopReason = `遇到已同步旧内容，停止滚动：${item.title} ${item.sourceUrl}`;
+      emitProgress(stopReason, {
+        candidates: seen.size,
+        pageUrl: item.sourceUrl,
+        pageTitle: item.title,
+      });
+      return "known";
+    }
+    const orderedItem = { ...item, listOrder: seen.size + 1 };
+    seen.set(item.sourceUrl, orderedItem);
+    emitProgress(`发现内容 ${seen.size}: ${orderedItem.title} ${orderedItem.sourceUrl}`, {
+      candidates: seen.size,
+      pageUrl: orderedItem.sourceUrl,
+      pageTitle: orderedItem.title,
+    });
+    onDiscovered?.(orderedItem, seen.size);
+    return "added";
+  };
 
   for (let index = 0; index < 9999999; index += 1) {
     const batch = await readVisibleCards();
     const beforeSize = seen.size;
     for (const item of batch) {
-      if (!seen.has(item.sourceUrl)) {
-        const orderedItem = { ...item, listOrder: seen.size + 1 };
-        seen.set(item.sourceUrl, orderedItem);
-        emitProgress(`发现内容 ${seen.size}: ${orderedItem.title} ${orderedItem.sourceUrl}`, {
-          candidates: seen.size,
-          pageUrl: orderedItem.sourceUrl,
-          pageTitle: orderedItem.title,
-        });
-        onDiscovered?.(orderedItem, seen.size);
+      if (addDiscoveredItem(item) === "known") {
+        break;
       }
+    }
+    if (stopReason) {
+      break;
     }
     const scrollInfo = await scrollListPage();
     await page.waitForTimeout(1600);
     const afterScrollBatch = await readVisibleCards();
     for (const item of afterScrollBatch) {
-      if (!seen.has(item.sourceUrl)) {
-        const orderedItem = { ...item, listOrder: seen.size + 1 };
-        seen.set(item.sourceUrl, orderedItem);
-        emitProgress(`发现内容 ${seen.size}: ${orderedItem.title} ${orderedItem.sourceUrl}`, {
-          candidates: seen.size,
-          pageUrl: orderedItem.sourceUrl,
-          pageTitle: orderedItem.title,
-        });
-        onDiscovered?.(orderedItem, seen.size);
+      if (addDiscoveredItem(item) === "known") {
+        break;
       }
+    }
+    if (stopReason) {
+      break;
     }
     if (seen.size === beforeSize) {
       stableRounds += 1;
     } else {
       stableRounds = 0;
     }
-    if (scrollInfo.isAtBottom && scrollInfo.scrollHeight === lastScrollHeight) {
+    const heightUnchanged = lastScrollHeight > 0 && scrollInfo.scrollHeight === lastScrollHeight;
+    if (scrollInfo.isAtBottom && heightUnchanged) {
       bottomRounds += 1;
     } else {
       bottomRounds = 0;
@@ -1066,6 +1088,14 @@ async function collectList(page, options = {}) {
       pageTitle: await page.title().catch(() => ""),
       },
     );
+    if (heightUnchanged && seen.size === beforeSize) {
+      emitProgress(`滚动后总高度不变且没有新增内容，判断已到底，停止滚动`, {
+        candidates: seen.size,
+        pageUrl: page.url(),
+        pageTitle: await page.title().catch(() => ""),
+      });
+      break;
+    }
     if (scrollInfo.endMarker && bottomRounds >= 3 && stableRounds >= 2) {
       break;
     }
@@ -1081,19 +1111,13 @@ async function collectList(page, options = {}) {
 
   const finalBatch = await readVisibleCards();
   for (const item of finalBatch) {
-    if (!seen.has(item.sourceUrl)) {
-      const orderedItem = { ...item, listOrder: seen.size + 1 };
-      seen.set(item.sourceUrl, orderedItem);
-      emitProgress(`发现内容 ${seen.size}: ${orderedItem.title} ${orderedItem.sourceUrl}`, {
-        candidates: seen.size,
-        pageUrl: orderedItem.sourceUrl,
-        pageTitle: orderedItem.title,
-      });
-      onDiscovered?.(orderedItem, seen.size);
+    if (addDiscoveredItem(item) === "known") {
+      break;
     }
   }
 
   const results = Array.from(seen.values());
+  results.stopReason = stopReason;
   return results;
 }
 
@@ -1414,6 +1438,8 @@ async function main() {
   const streamedListUrls = new Set();
   emitProgress(`扫描当前今日头条${job.source === "likes" ? "喜欢" : "收藏"}页面`);
   const list = await collectList(page, {
+    knownRemoteIds: job.knownRemoteIds,
+    stopOnKnownDuplicate: !isDownloadMode,
     onDiscovered: isListMode
       ? (item) => {
           if (streamedListUrls.has(item.sourceUrl)) {
@@ -1426,7 +1452,32 @@ async function main() {
       : null,
   });
   if (!list.length) {
-    throw new Error(buildNoResultError(pageInfo, job.source));
+    if (list.stopReason) {
+      emitProgress(list.stopReason, {
+        candidates: 0,
+        skipped: 1,
+        discovered: 0,
+        saved: 0,
+        downloaded: 0,
+        pageUrl: pageInfo.url,
+        pageTitle: pageInfo.title,
+      });
+      emit({ type: "done", summary: { candidates: 0, skipped: 1, discovered: 0, saved: 0, downloaded: 0 } });
+      await browser.close();
+      return;
+    }
+    emitProgress(`当前${job.source === "likes" ? "喜欢" : "收藏"}列表未发现可同步内容，按已完成处理`, {
+      candidates: 0,
+      skipped: 0,
+      discovered: 0,
+      saved: 0,
+      downloaded: 0,
+      pageUrl: pageInfo.url,
+      pageTitle: pageInfo.title,
+    });
+    emit({ type: "done", summary: { candidates: 0, skipped: 0, discovered: 0, saved: 0, downloaded: 0 } });
+    await browser.close();
+    return;
   }
 
   if (mode === "diagnose") {

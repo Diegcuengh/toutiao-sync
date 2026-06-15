@@ -11,7 +11,7 @@ use crate::{
     build_info,
     db,
     error::AppError,
-    models::{AppBootstrap, ContentItem, DiagnosePageRequest, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncStartRequest, TagOption, UserProfile},
+    models::{AppBootstrap, DiagnosePageRequest, LoginStatus, PageDiagnosis, PagedContentItems, SyncEvent, SyncSession, SyncStartRequest, TagOption, UserProfile},
     sync,
 };
 
@@ -137,10 +137,20 @@ pub fn search_items(
     source: Option<String>,
     content_type: Option<String>,
     tag_filters: Option<Vec<String>>,
-) -> Result<Vec<ContentItem>, AppError> {
+    page: Option<i64>,
+    page_size: Option<i64>,
+) -> Result<PagedContentItems, AppError> {
     log_command("search_items");
     let conn = db::connect(&state.db_path()?)?;
-    db::search_items(&conn, &query, source.as_deref(), content_type.as_deref(), tag_filters.as_deref().unwrap_or(&[]))
+    db::search_items_page(
+        &conn,
+        &query,
+        source.as_deref(),
+        content_type.as_deref(),
+        tag_filters.as_deref().unwrap_or(&[]),
+        page.unwrap_or(1),
+        page_size.unwrap_or(50),
+    )
 }
 
 #[tauri::command]
