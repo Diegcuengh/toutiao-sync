@@ -79,6 +79,7 @@ export interface ContentItem {
   articlePath?: string | null;
   videoPath?: string | null;
   localDir?: string | null;
+  listOrder?: number | null;
   syncedAt: string;
   downloaded: boolean;
   rawJson: string;

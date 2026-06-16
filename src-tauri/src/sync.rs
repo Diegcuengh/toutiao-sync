@@ -25,6 +25,7 @@ struct ScriptJob<'a> {
     chrome_user_data_dir: String,
     cdp_port: u16,
     known_remote_ids: Vec<String>,
+    download_items: Vec<serde_json::Value>,
 }
 
 pub fn spawn_sync(state: AppState, session: SyncSession) -> Result<(), AppError> {
@@ -36,12 +37,15 @@ pub fn spawn_sync(state: AppState, session: SyncSession) -> Result<(), AppError>
 
     let job_path = jobs_dir.join(format!("{}.json", session.id));
     AppState::ensure_parent(&job_path)?;
-    let known_remote_ids = {
+    let (known_remote_ids, download_items) = {
         let conn = db::connect(&db_path)?;
         if session.mode == "download" {
-            db::list_remote_ids_requiring_download(&conn, &session.source)?
+            (
+                db::list_remote_ids_requiring_download(&conn, &session.source)?,
+                db::list_items_requiring_download(&conn, &session.source)?,
+            )
         } else {
-            db::list_known_remote_ids(&conn, &session.source)?
+            (db::list_known_remote_ids(&conn, &session.source)?, Vec::new())
         }
     };
     let job = ScriptJob {
@@ -54,6 +58,7 @@ pub fn spawn_sync(state: AppState, session: SyncSession) -> Result<(), AppError>
         chrome_user_data_dir: chrome_user_data_dir.display().to_string(),
         cdp_port: state.chrome_cdp_port,
         known_remote_ids,
+        download_items,
     };
     fs::write(&job_path, serde_json::to_vec_pretty(&job)?)?;
 
@@ -108,6 +113,7 @@ pub fn diagnose_page(state: &AppState, source: &str) -> Result<PageDiagnosis, Ap
         chrome_user_data_dir: chrome_user_data_dir.display().to_string(),
         cdp_port: state.chrome_cdp_port,
         known_remote_ids: Vec::new(),
+        download_items: Vec::new(),
     };
     fs::write(&job_path, serde_json::to_vec_pretty(&job)?)?;
 
@@ -134,6 +140,7 @@ pub fn check_login_status(state: &AppState, source: &str) -> Result<LoginStatus,
         chrome_user_data_dir: chrome_user_data_dir.display().to_string(),
         cdp_port: state.chrome_cdp_port,
         known_remote_ids: Vec::new(),
+        download_items: Vec::new(),
     };
     fs::write(&job_path, serde_json::to_vec_pretty(&job)?)?;
 
@@ -181,8 +188,16 @@ fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> Result<
             continue;
         }
 
-        let event: ScriptEvent = serde_json::from_str(&line)?;
         let conn = db::connect(&state.db_path()?)?;
+        let event: ScriptEvent = match serde_json::from_str(&line) {
+            Ok(event) => event,
+            Err(error) => {
+                let message = format!("脚本输出解析失败，已跳过当前输出行并继续：{error}");
+                println!("[sync] {}", message);
+                db::insert_sync_event(&conn, &session.id, "error", &message)?;
+                continue;
+            }
+        };
 
         match event {
             ScriptEvent::Progress {

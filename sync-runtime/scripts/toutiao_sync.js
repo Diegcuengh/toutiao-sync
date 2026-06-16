@@ -10,7 +10,20 @@ let axios;
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 
 function emit(payload) {
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
+  process.stdout.write(`${JSON.stringify(sanitizeForJson(payload))}\n`);
+}
+
+function sanitizeForJson(value) {
+  if (typeof value === "string") {
+    return value.replace(/[\uD800-\uDFFF]/g, "\uFFFD");
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeForJson(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitizeForJson(item)]));
+  }
+  return value;
 }
 
 function emitProgress(message, extra = {}) {
@@ -54,6 +67,7 @@ function normalizeJobConfig(rawJob) {
   const dataDir = rawJob.dataDir || rawJob.data_dir;
   const downloadDir = rawJob.downloadDir || rawJob.download_dir;
   const knownRemoteIds = rawJob.knownRemoteIds || rawJob.known_remote_ids || [];
+  const downloadItems = rawJob.downloadItems || rawJob.download_items || [];
   const cdpPort = rawJob.cdpPort || rawJob.cdp_port || 9222;
   const chromeUserDataDir = rawJob.chromeUserDataDir || rawJob.chrome_user_data_dir;
   const maxItems = Number(rawJob.maxItems || rawJob.max_items || 0) || 0;
@@ -70,6 +84,7 @@ function normalizeJobConfig(rawJob) {
     dataDir,
     downloadDir,
     knownRemoteIds,
+    downloadItems,
     cdpPort,
     chromeUserDataDir,
     maxItems,
@@ -253,6 +268,30 @@ function legacyRemoteIds(item) {
     // ignore invalid URLs
   }
   return legacyIds;
+}
+
+function remoteIdentityCandidates(item) {
+  const identities = new Set();
+  const canonicalId = canonicalRemoteId(item);
+  if (canonicalId) {
+    identities.add(canonicalId);
+    identities.add(hashText(canonicalId));
+    const bareId = canonicalId.split(":").pop();
+    if (bareId) {
+      identities.add(bareId);
+    }
+  }
+  for (const legacyId of legacyRemoteIds(item)) {
+    identities.add(legacyId);
+    if (legacyId) {
+      identities.add(hashText(legacyId));
+    }
+  }
+  if (item.sourceUrl) {
+    identities.add(item.sourceUrl);
+    identities.add(normalizeUrl(item.sourceUrl));
+  }
+  return identities;
 }
 
 function stableLocalId(item) {
@@ -577,10 +616,16 @@ async function findSourceListEntry(page, source) {
 }
 
 function normalizeSourceListUrl(url, source) {
+  const tab = source === "likes" ? "digg" : "fav";
   try {
-    const sanitized = String(url).replace("?source=", "&source=");
-    const parsed = new URL(sanitized, "https://www.toutiao.com/");
-    parsed.searchParams.set("tab", source === "likes" ? "digg" : "fav");
+    const rawUrl = String(url);
+    const tokenMatch = rawUrl.match(/\/c\/user\/token\/([^/?#&]+)\/?/);
+    if (tokenMatch?.[1]) {
+      return `https://www.toutiao.com/c/user/token/${tokenMatch[1]}/?tab=${tab}&source=mine_profile`;
+    }
+    const parsed = new URL(rawUrl, "https://www.toutiao.com/");
+    parsed.search = "";
+    parsed.searchParams.set("tab", tab);
     parsed.searchParams.set("source", "mine_profile");
     return parsed.toString();
   } catch {
@@ -589,11 +634,7 @@ function normalizeSourceListUrl(url, source) {
 }
 
 function buildSourceListUrl(baseUrl, source) {
-  const parsed = new URL(baseUrl);
-  parsed.search = "";
-  parsed.searchParams.set("tab", source === "likes" ? "digg" : "fav");
-  parsed.searchParams.set("source", "mine_profile");
-  return parsed.toString();
+  return normalizeSourceListUrl(baseUrl, source);
 }
 
 async function resetAllScrollToTop(page) {
@@ -662,9 +703,7 @@ async function collectList(page, options = {}) {
   const knownSet = new Set((knownRemoteIds || []).map((item) => String(item)));
   const stopOnKnownDuplicate = options.stopOnKnownDuplicate !== false && knownSet.size > 0;
   const isKnownItem = (item) => {
-    const canonicalId = canonicalRemoteId(item);
-    const legacyId = hashText(canonicalId);
-    return knownSet.has(canonicalId) || knownSet.has(legacyId) || Array.from(legacyRemoteIds(item)).some((id) => knownSet.has(id));
+    return Array.from(remoteIdentityCandidates(item)).some((id) => knownSet.has(id));
   };
   await page.bringToFront();
   await resetAllScrollToTop(page);
@@ -1173,9 +1212,7 @@ function buildNoResultError(info, source) {
 function filterIncrementalCandidates(list, knownRemoteIds) {
   const knownSet = new Set((knownRemoteIds || []).map((item) => String(item)));
   return list.filter((item) => {
-    const canonicalId = canonicalRemoteId(item);
-    const legacyId = hashText(canonicalId);
-    return !knownSet.has(canonicalId) && !knownSet.has(legacyId) && !Array.from(legacyRemoteIds(item)).some((id) => knownSet.has(id));
+    return !Array.from(remoteIdentityCandidates(item)).some((id) => knownSet.has(id));
   });
 }
 
@@ -1185,8 +1222,10 @@ function filterDownloadCandidates(list, targetRemoteIds) {
     return [];
   }
   return list.filter((item) => {
-    const canonicalId = canonicalRemoteId(item);
-    return targetSet.has(canonicalId) || targetSet.has(hashText(canonicalId)) || Array.from(legacyRemoteIds(item)).some((id) => targetSet.has(id));
+    if ((item.contentType || "").toLowerCase() === "video" || item.sourceUrl.includes("/video/")) {
+      return false;
+    }
+    return Array.from(remoteIdentityCandidates(item)).some((id) => targetSet.has(id));
   });
 }
 
@@ -1247,34 +1286,34 @@ function normalizeText(text) {
 }
 
 async function collectDetail(page, job, item) {
+  if ((item.contentType || "").toLowerCase() === "video" || item.sourceUrl.includes("/video/")) {
+    throw new Error("跳过视频内容：当前下载模式只下载文章");
+  }
   await page.goto(item.sourceUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
   await page.waitForTimeout(2500);
 
   const detail = await page.evaluate(() => {
     const readText = (selector) => document.querySelector(selector)?.textContent?.trim() || "";
-    const title = document.querySelector("h1")?.textContent?.trim() || document.title;
-    const article = document.querySelector("article");
-    const contentText = article?.textContent?.trim() || document.body?.innerText?.trim() || "";
+    const main = document.querySelector(".main");
+    if (!main) {
+      throw new Error("文章详情页未找到 class=\"main\" 内容区");
+    }
+    const contentRoot = main.querySelector(".show-monitor");
+    if (!contentRoot) {
+      throw new Error("文章详情页未找到 .main .show-monitor 正文区");
+    }
+    const title = main.querySelector("h1")?.textContent?.trim() || document.querySelector("h1")?.textContent?.trim() || document.title;
+    const contentText = contentRoot.textContent?.trim() || "";
     const summary = contentText.slice(0, 500);
     const author = readText("[class*='author']") || readText("a[href*='user']");
-    const videoNode = document.querySelector("video");
-    const videoUrl =
-      videoNode?.currentSrc ||
-      videoNode?.getAttribute("src") ||
-      videoNode?.querySelector("source")?.src ||
-      videoNode?.querySelector("source")?.getAttribute("src") ||
-      "";
-    const coverNode =
-      document.querySelector("article img") ||
-      document.querySelector("video[poster]") ||
-      document.querySelector("img");
+    const coverNode = contentRoot.querySelector("img");
     return {
       title,
       summary,
       contentText,
       author,
-      html: document.documentElement.outerHTML,
-      videoUrl,
+      html: contentRoot.outerHTML,
+      videoUrl: "",
       coverUrl:
         coverNode?.getAttribute?.("poster") ||
         coverNode?.currentSrc ||
@@ -1318,36 +1357,29 @@ async function collectDetail(page, job, item) {
     ),
   );
 
-  let videoPath = null;
   let downloaded = true;
-
-  const resolvedVideoUrl = resolveAssetUrl(detail.videoUrl, detail.pageUrl || item.sourceUrl);
-  if (resolvedVideoUrl) {
-    const ext = path.extname(resolvedVideoUrl.split("?")[0]) || ".mp4";
-    videoPath = path.join(itemDir, `video${ext}`);
-    await downloadToFile(resolvedVideoUrl, videoPath);
-  }
 
   return {
     remote_id: canonicalRemoteId(item),
-    title: detail.title || item.title,
-    summary: textToSummary(detail.summary || item.summary),
+    title: item.title || detail.title,
+    summary: item.summary || textToSummary(detail.summary),
     content_text: normalizeText(detail.contentText),
-    author: detail.author,
-    content_type: resolvedVideoUrl ? "video" : "article",
+    author: item.author || detail.author,
+    content_type: "article",
     source_url: item.sourceUrl,
     cover_url: resolvedCoverUrl || null,
     cover_path: coverPath,
     article_path: articlePath,
-    video_path: videoPath,
+    video_path: null,
     local_dir: itemDir,
     downloaded,
     raw: {
-      list: item,
+      ...(item.raw && typeof item.raw === "object" ? item.raw : {}),
       detail: {
+        title: detail.title,
         author: detail.author,
         coverUrl: resolvedCoverUrl,
-        videoUrl: resolvedVideoUrl,
+        videoUrl: null,
       },
     },
   };
@@ -1382,6 +1414,71 @@ async function main() {
     return;
   }
   await ensureLoggedIn(page, job.source);
+
+  if (isDownloadMode) {
+    const downloadQueue = Array.isArray(job.downloadItems) ? job.downloadItems : [];
+    emitProgress(`待下载文章 ${downloadQueue.length} 条；已下载内容会自动跳过`, {
+      candidates: downloadQueue.length,
+      skipped: 0,
+      discovered: downloadQueue.length,
+      saved: 0,
+      downloaded: 0,
+    });
+    if (!downloadQueue.length) {
+      emit({ type: "done", summary: { candidates: 0, skipped: 0, discovered: 0, saved: 0, downloaded: 0 } });
+      await browser.close();
+      return;
+    }
+
+    let saved = 0;
+    let downloaded = 0;
+    const detailContext = browser.contexts()[0] ?? (await browser.newContext());
+    const detailPage = await detailContext.newPage();
+    try {
+      for (let index = 0; index < downloadQueue.length; index += 1) {
+        const item = downloadQueue[index];
+        emitProgress(`下载内容 ${index + 1}/${downloadQueue.length}: ${item.title}`, {
+          candidates: downloadQueue.length,
+          skipped: 0,
+          discovered: downloadQueue.length,
+          processed: index + 1,
+          saved,
+          downloaded,
+          pageUrl: item.sourceUrl,
+          pageTitle: item.title,
+        });
+        try {
+          const detail = await collectDetail(detailPage, job, item);
+          if (detail.downloaded) {
+            downloaded += 1;
+          }
+          saved += 1;
+          emit({ type: "item", item: detail });
+          emitProgress(`已下载并入库 ${saved}/${downloadQueue.length}: ${detail.title}`, {
+            candidates: downloadQueue.length,
+            skipped: 0,
+            discovered: downloadQueue.length,
+            processed: index + 1,
+            saved,
+            downloaded,
+            pageUrl: detail.source_url,
+            pageTitle: detail.title,
+          });
+        } catch (error) {
+          emit({
+            type: "item_error",
+            sourceUrl: item.sourceUrl,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    } finally {
+      await detailPage.close().catch(() => {});
+    }
+    emit({ type: "done", summary: { candidates: downloadQueue.length, skipped: 0, discovered: downloadQueue.length, saved, downloaded } });
+    await browser.close();
+    return;
+  }
 
   let pageInfo = await inspectCurrentPage(page, job.source);
   if (!isOnTargetList(pageInfo, job.source)) {
@@ -1436,7 +1533,7 @@ async function main() {
 
   let streamedListSaved = 0;
   const streamedListUrls = new Set();
-  emitProgress(`扫描当前今日头条${job.source === "likes" ? "喜欢" : "收藏"}页面`);
+  emitProgress(`扫描当前今日头条${job.source === "likes" ? "喜欢" : "收藏"}页面，已知旧内容 ${job.knownRemoteIds.length} 个`);
   const list = await collectList(page, {
     knownRemoteIds: job.knownRemoteIds,
     stopOnKnownDuplicate: !isDownloadMode,

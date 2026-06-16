@@ -51,7 +51,7 @@ let searchTimer: number | undefined;
 let pollTick = 0;
 let refreshInFlight = false;
 let lastItemRefreshAt = 0;
-const ITEM_REFRESH_INTERVAL_MS = 5_000;
+const ITEM_REFRESH_INTERVAL_MS = 1_000;
 const PAGE_SIZE = 50;
 const originalHtmlCache = new Map<string, string>();
 
@@ -91,9 +91,18 @@ function parseRawJson(item: ContentItem) {
   }
 }
 
+function getRawListHtml(raw: any) {
+  const direct = raw?.list?.listHtml;
+  if (typeof direct === "string" && direct.trim()) {
+    return direct;
+  }
+  const nested = raw?.list?.raw?.list?.listHtml;
+  return typeof nested === "string" ? nested : "";
+}
+
 function getListText(item: ContentItem) {
   const raw = parseRawJson(item);
-  const html = raw?.list?.listHtml || "";
+  const html = getRawListHtml(raw);
   if (typeof html !== "string" || !html.trim()) {
     return item.summary || item.title;
   }
@@ -103,7 +112,7 @@ function getListText(item: ContentItem) {
 
 function getListImage(item: ContentItem) {
   const raw = parseRawJson(item);
-  const html = raw?.list?.listHtml || "";
+  const html = getRawListHtml(raw);
   if (typeof html !== "string" || !html.trim()) {
     return item.coverUrl || "";
   }
@@ -124,7 +133,7 @@ function getOriginalCardHtml(item: ContentItem) {
     return cached;
   }
   const raw = parseRawJson(item);
-  const html = raw?.list?.listHtml || "";
+  const html = getRawListHtml(raw);
   if (typeof html !== "string" || !html.trim()) {
     originalHtmlCache.set(cacheKey, "");
     return "";
@@ -177,7 +186,13 @@ function getOriginalCardHtml(item: ContentItem) {
   if (footerTarget) {
     const localMeta = doc.createElement("span");
     localMeta.className = "local-sync-meta";
-    [item.downloaded ? "已下载" : "未下载", item.contentType === "video" ? "视频" : "文章"].forEach((value) => {
+    [
+      item.downloaded ? "已下载" : "未下载",
+      item.contentType === "video" ? "视频" : "文章",
+      item.listOrder ? `序号 ${item.listOrder}` : "",
+    ]
+      .filter(Boolean)
+      .forEach((value) => {
       const metaItem = doc.createElement("span");
       metaItem.textContent = value;
       localMeta.appendChild(metaItem);
@@ -282,7 +297,7 @@ function startPolling() {
     pollTick += 1;
     const shouldRefreshItems =
       activeTab.value === "local" &&
-      Date.now() - lastItemRefreshAt >= ITEM_REFRESH_INTERVAL_MS;
+      (syncing.value || Date.now() - lastItemRefreshAt >= ITEM_REFRESH_INTERVAL_MS);
     void loadAll({
       includeEvents: true,
       includeItems: shouldRefreshItems,
@@ -315,7 +330,7 @@ async function handleDownloadContent() {
   try {
     const session = await startSync({ source: syncSource.value, mode: "download" });
     selectedSessionId.value = session.id;
-    await loadAll({ includeItems: false, includeEvents: true });
+    await loadAll({ includeItems: true, includeEvents: true });
   } catch (err) {
     syncing.value = false;
     error.value = err instanceof Error ? err.message : String(err);
@@ -792,6 +807,7 @@ onBeforeUnmount(() => {
                 <span>{{ entry.item.downloaded ? "已下载" : "未下载" }}</span>
                 <span v-if="entry.item.author">{{ entry.item.author }}</span>
                 <span>{{ entry.item.contentType === "video" ? "视频" : "文章" }}</span>
+                <span v-if="entry.item.listOrder">序号 {{ entry.item.listOrder }}</span>
                 <button
                   v-if="entry.item.articlePath"
                   class="link-button"

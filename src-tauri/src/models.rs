@@ -106,6 +106,7 @@ pub struct ContentItem {
     pub article_path: Option<String>,
     pub video_path: Option<String>,
     pub local_dir: Option<String>,
+    pub list_order: Option<i64>,
     pub synced_at: String,
     pub downloaded: bool,
     pub raw_json: String,

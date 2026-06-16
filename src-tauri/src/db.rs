@@ -1,6 +1,11 @@
-﻿use std::path::Path;
+﻿use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use rusqlite::{params, Connection, OptionalExtension};
+use scraper::{Html, Selector};
 
 use crate::{
     error::AppError,
@@ -68,6 +73,11 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
           updated_at TEXT NOT NULL DEFAULT ''
         );
 
+        CREATE TABLE IF NOT EXISTS app_meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_content_items_title ON content_items(title);
         CREATE INDEX IF NOT EXISTS idx_content_items_synced_at ON content_items(synced_at DESC);
         CREATE INDEX IF NOT EXISTS idx_sync_events_session_id ON sync_events(session_id);
@@ -99,11 +109,14 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
     ensure_column(&conn, "content_items", "list_order", "INTEGER")?;
     ensure_column(&conn, "content_items", "list_run_id", "TEXT")?;
     migrate_legacy_remote_ids(&conn)?;
+    restore_downloaded_list_metadata(&conn)?;
+    repair_downloaded_article_bodies(&conn)?;
     classify_existing_items(&conn)?;
     Ok(conn)
 }
 
 const DEFAULT_TAGS: [&str; 9] = ["IT", "编程", "运动", "医学", "文化", "壮族", "语言", "汉族", "基因"];
+const DOWNLOADED_ARTICLE_BODY_REPAIR_KEY: &str = "repair_downloaded_article_bodies_v1";
 
 fn tag_rules(tag: &str) -> &'static [&'static str] {
     match tag {
@@ -234,6 +247,71 @@ fn canonical_remote_id_from_url(source_url: &str, fallback_type: &str, remote_id
     None
 }
 
+fn bare_remote_id_from_url(source_url: &str) -> Option<String> {
+    for kind in ["article", "video", "w"] {
+        let marker = format!("/{kind}/");
+        if let Some(start) = source_url.find(&marker) {
+            let rest = &source_url[start + marker.len()..];
+            let id = rest
+                .split(|character| character == '/' || character == '?' || character == '#')
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !id.is_empty() {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn normalized_remote_url(source_url: &str) -> Option<String> {
+    let value = source_url.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let without_hash = value.split('#').next().unwrap_or(value);
+    let without_query = without_hash.split('?').next().unwrap_or(without_hash);
+    Some(without_query.trim_end_matches('/').to_string())
+}
+
+fn insert_known_remote_id_variants(
+    ids: &mut BTreeSet<String>,
+    remote_id: &str,
+    source_url: &str,
+    content_type: &str,
+) {
+    let remote_id = remote_id.trim();
+    if !remote_id.is_empty() {
+        ids.insert(remote_id.to_string());
+        if let Some((_, bare_id)) = remote_id.split_once(':') {
+            if !bare_id.trim().is_empty() {
+                ids.insert(bare_id.trim().to_string());
+            }
+        }
+    }
+    if let Some(canonical_id) = canonical_remote_id_from_url(source_url, content_type, remote_id) {
+        ids.insert(canonical_id.clone());
+        if let Some((_, bare_id)) = canonical_id.split_once(':') {
+            if !bare_id.trim().is_empty() {
+                ids.insert(bare_id.trim().to_string());
+            }
+        }
+    }
+    if let Some(bare_id) = bare_remote_id_from_url(source_url) {
+        ids.insert(bare_id);
+    }
+    let source_url = source_url.trim();
+    if !source_url.is_empty() {
+        ids.insert(source_url.to_string());
+    }
+    if let Some(normalized_url) = normalized_remote_url(source_url) {
+        if !normalized_url.is_empty() {
+            ids.insert(normalized_url);
+        }
+    }
+}
+
 fn migrate_legacy_remote_ids(conn: &Connection) -> Result<(), AppError> {
     let mut stmt = conn.prepare(
         r#"
@@ -300,6 +378,207 @@ fn migrate_legacy_remote_ids(conn: &Connection) -> Result<(), AppError> {
         }
     }
 
+    Ok(())
+}
+
+fn restore_downloaded_list_metadata(conn: &Connection) -> Result<(), AppError> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, raw_json
+        FROM content_items
+        WHERE raw_json LIKE '%"raw"%'
+          AND raw_json LIKE '%"listHtml"%'
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+
+    let mut updates = Vec::new();
+    for row in rows {
+        let (id, raw_json) = row?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw_json) else {
+            continue;
+        };
+        let Some(list) = value.get("list").and_then(|item| item.as_object()) else {
+            continue;
+        };
+        let Some(nested_raw) = list.get("raw").cloned() else {
+            continue;
+        };
+        let has_original_card = nested_raw
+            .get("list")
+            .and_then(|item| item.get("listHtml"))
+            .and_then(|item| item.as_str())
+            .map(|item| !item.trim().is_empty())
+            .unwrap_or(false);
+        if !has_original_card {
+            continue;
+        }
+
+        let mut restored_raw = nested_raw;
+        if let Some(detail) = value.get("detail") {
+            if let Some(raw_object) = restored_raw.as_object_mut() {
+                raw_object.insert("detail".to_string(), detail.clone());
+            }
+        }
+
+        let title = list.get("title").and_then(|item| item.as_str()).unwrap_or("").trim().to_string();
+        let summary = list.get("summary").and_then(|item| item.as_str()).unwrap_or("").trim().to_string();
+        let cover_url = list.get("coverUrl").and_then(|item| item.as_str()).map(str::trim).filter(|item| !item.is_empty()).map(ToString::to_string);
+        updates.push((id, title, summary, cover_url, restored_raw.to_string()));
+    }
+    drop(stmt);
+
+    for (id, title, summary, cover_url, raw_json) in updates {
+        conn.execute(
+            r#"
+            UPDATE content_items
+            SET title = CASE WHEN ?2 = '' THEN title ELSE ?2 END,
+                summary = CASE WHEN ?3 = '' THEN summary ELSE ?3 END,
+                cover_url = COALESCE(?4, cover_url),
+                raw_json = ?5
+            WHERE id = ?1
+            "#,
+            params![id, title, summary, cover_url, raw_json],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn get_app_meta(conn: &Connection, key: &str) -> Result<Option<String>, AppError> {
+    conn.query_row(
+        "SELECT value FROM app_meta WHERE key = ?1",
+        [key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(AppError::from)
+}
+
+fn set_app_meta(conn: &Connection, key: &str, value: &str) -> Result<(), AppError> {
+    conn.execute(
+        r#"
+        INSERT INTO app_meta (key, value)
+        VALUES (?1, ?2)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        "#,
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn normalize_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn extract_show_monitor_content(html: &str) -> Option<(String, String)> {
+    let document = Html::parse_fragment(html);
+    let selector = Selector::parse(".show-monitor").ok()?;
+    let element = document.select(&selector).next()?;
+    let outer_html = element.html();
+    let content_text = element.text().collect::<Vec<_>>().join("").trim().to_string();
+    Some((outer_html, content_text))
+}
+
+fn repair_article_json_file(json_path: &Path, content_html: &str, content_text: &str) -> Result<(), AppError> {
+    if !json_path.exists() {
+        return Ok(());
+    }
+
+    let raw = match fs::read_to_string(json_path) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    let mut value = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+
+    object.insert("html".to_string(), serde_json::Value::String(content_html.to_string()));
+    object.insert("contentText".to_string(), serde_json::Value::String(content_text.to_string()));
+    object.insert(
+        "summary".to_string(),
+        serde_json::Value::String(truncate_chars(content_text, 500)),
+    );
+
+    fs::write(json_path, serde_json::to_string_pretty(&value)?)?;
+    Ok(())
+}
+
+fn repair_downloaded_article_bodies(conn: &Connection) -> Result<(), AppError> {
+    if get_app_meta(conn, DOWNLOADED_ARTICLE_BODY_REPAIR_KEY)?.as_deref() == Some("done") {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, article_path, local_dir
+        FROM content_items
+        WHERE article_path IS NOT NULL
+          AND article_path != ''
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+
+    let mut content_updates = Vec::new();
+    for row in rows {
+        let (id, article_path, local_dir) = row?;
+        let article_path = PathBuf::from(article_path);
+        let raw_html = match fs::read_to_string(&article_path) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Some((content_html, content_text)) = extract_show_monitor_content(&raw_html) else {
+            continue;
+        };
+
+        let trimmed_text = content_text.trim().to_string();
+        let normalized_text = normalize_text(&trimmed_text);
+        if normalized_text.is_empty() {
+            continue;
+        }
+
+        if raw_html.trim() != content_html.trim() {
+            let _ = fs::write(&article_path, &content_html);
+        }
+
+        let json_path = local_dir
+            .as_ref()
+            .map(|dir| Path::new(dir).join("article.json"))
+            .unwrap_or_else(|| article_path.with_file_name("article.json"));
+        let _ = repair_article_json_file(&json_path, &content_html, &trimmed_text);
+
+        content_updates.push((id, normalized_text));
+    }
+    drop(stmt);
+
+    for (id, content_text) in content_updates {
+        conn.execute(
+            r#"
+            UPDATE content_items
+            SET content_text = ?2
+            WHERE id = ?1
+              AND content_text != ?2
+            "#,
+            params![id, content_text],
+        )?;
+    }
+
+    set_app_meta(conn, DOWNLOADED_ARTICLE_BODY_REPAIR_KEY, "done")?;
     Ok(())
 }
 
@@ -425,8 +704,8 @@ pub fn list_remote_ids_requiring_download(conn: &Connection, source: &str) -> Re
         SELECT remote_id
         FROM content_items
         WHERE source = ?1
+          AND content_type = 'article'
           AND article_path IS NULL
-          AND video_path IS NULL
         ORDER BY synced_at DESC
         "#,
     )?;
@@ -436,6 +715,47 @@ pub fn list_remote_ids_requiring_download(conn: &Connection, source: &str) -> Re
         ids.push(row?);
     }
     Ok(ids)
+}
+
+pub fn list_items_requiring_download(conn: &Connection, source: &str) -> Result<Vec<serde_json::Value>, AppError> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT remote_id, title, summary, author, content_type, source_url, cover_url, list_order, raw_json
+        FROM content_items
+        WHERE source = ?1
+          AND content_type = 'article'
+          AND article_path IS NULL
+        ORDER BY synced_at DESC, CASE WHEN list_order IS NULL THEN 1 ELSE 0 END, list_order ASC
+        "#,
+    )?;
+    let rows = stmt.query_map([source], |row| {
+        let remote_id: String = row.get(0)?;
+        let title: String = row.get(1)?;
+        let summary: String = row.get(2)?;
+        let author: String = row.get(3)?;
+        let content_type: String = row.get(4)?;
+        let source_url: String = row.get(5)?;
+        let cover_url: Option<String> = row.get(6)?;
+        let list_order: Option<i64> = row.get(7)?;
+        let raw_json: String = row.get(8)?;
+        let raw = serde_json::from_str::<serde_json::Value>(&raw_json).unwrap_or_else(|_| serde_json::json!({}));
+        Ok(serde_json::json!({
+            "remoteId": remote_id,
+            "title": title,
+            "summary": summary,
+            "author": author,
+            "contentType": content_type,
+            "sourceUrl": source_url,
+            "coverUrl": cover_url,
+            "listOrder": list_order,
+            "raw": raw,
+        }))
+    })?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row?);
+    }
+    Ok(items)
 }
 
 pub fn list_sync_events(conn: &Connection, session_id: Option<&str>) -> Result<Vec<SyncEvent>, AppError> {
@@ -658,7 +978,7 @@ pub fn search_items_page(
 
     let mut sql = format!(
         r#"
-        SELECT id, remote_id, source, title, summary, content_text, author, content_type, source_url, cover_url, cover_path, article_path, video_path, local_dir, synced_at, raw_json,
+        SELECT id, remote_id, source, title, summary, content_text, author, content_type, source_url, cover_url, cover_path, article_path, video_path, local_dir, list_order, synced_at, raw_json,
                CASE WHEN article_path IS NOT NULL OR video_path IS NOT NULL THEN 1 ELSE 0 END AS downloaded,
                COALESCE((
                  SELECT GROUP_CONCAT(tag, '||')
@@ -672,7 +992,13 @@ pub fn search_items_page(
     );
 
     if has_source {
-        sql.push_str(" ORDER BY synced_at DESC, CASE WHEN list_order IS NULL THEN 1 ELSE 0 END, list_order ASC");
+        sql.push_str(
+            r#" ORDER BY
+            COALESCE((SELECT started_at FROM sync_sessions WHERE sync_sessions.id = content_items.list_run_id), content_items.synced_at) DESC,
+            CASE WHEN list_order IS NULL THEN 1 ELSE 0 END,
+            list_order ASC,
+            id ASC"#,
+        );
     } else {
         sql.push_str(" ORDER BY synced_at DESC");
     }
@@ -696,11 +1022,12 @@ pub fn search_items_page(
             article_path: row.get(11)?,
             video_path: row.get(12)?,
             local_dir: row.get(13)?,
-            synced_at: row.get(14)?,
-            raw_json: row.get(15)?,
-            downloaded: row.get::<_, i64>(16)? == 1,
+            list_order: row.get(14)?,
+            synced_at: row.get(15)?,
+            raw_json: row.get(16)?,
+            downloaded: row.get::<_, i64>(17)? == 1,
             tags: row
-                .get::<_, String>(17)?
+                .get::<_, String>(18)?
                 .split("||")
                 .map(str::trim)
                 .filter(|tag| !tag.is_empty())
@@ -875,15 +1202,22 @@ pub fn get_item_file(conn: &Connection, item_id: i64, kind: &str) -> Result<Opti
 pub fn list_known_remote_ids(conn: &Connection, source: &str) -> Result<Vec<String>, AppError> {
     let mut stmt = conn.prepare(
         r#"
-        SELECT remote_id
+        SELECT remote_id, source_url, content_type
         FROM content_items
         WHERE source = ?1
         "#,
     )?;
-    let rows = stmt.query_map([source], |row| row.get::<_, String>(0))?;
-    let mut remote_ids = Vec::new();
+    let rows = stmt.query_map([source], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut remote_ids = BTreeSet::new();
     for row in rows {
-        remote_ids.push(row?);
+        let (remote_id, source_url, content_type) = row?;
+        insert_known_remote_id_variants(&mut remote_ids, &remote_id, &source_url, &content_type);
     }
-    Ok(remote_ids)
+    Ok(remote_ids.into_iter().collect())
 }
