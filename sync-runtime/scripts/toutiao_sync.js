@@ -264,6 +264,58 @@ function normalizeUrl(url) {
   }
 }
 
+function isDouyinSource(source) {
+  return String(source || "").startsWith("douyin_");
+}
+
+function sourceKind(source) {
+  return String(source || "").endsWith("likes") ? "likes" : "favorites";
+}
+
+function platformLabel(source) {
+  return isDouyinSource(source) ? "抖音" : "今日头条";
+}
+
+function sourceKindLabel(source) {
+  return sourceKind(source) === "likes" ? "点赞" : "收藏";
+}
+
+function sourceLabel(source) {
+  return `${platformLabel(source)}${sourceKindLabel(source)}`;
+}
+
+function douyinListUrl(source) {
+  const showTab = sourceKind(source) === "likes" ? "like" : "favorite_collection";
+  return `https://www.douyin.com/user/self?from_tab_name=main&showTab=${showTab}`;
+}
+
+function douyinContentIdentity(sourceUrl) {
+  try {
+    const parsed = new URL(sourceUrl);
+    const match = parsed.pathname.match(/\/(video|note)\/([^/?#]+)/);
+    if (match?.[1] && match?.[2]) {
+      return {
+        remoteId: `${match[1]}:${match[2]}`,
+        normalizedUrl: `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, ""),
+      };
+    }
+  } catch {
+    // Fall through to string parsing below.
+  }
+  const raw = String(sourceUrl || "");
+  const match = raw.match(/\/(video|note)\/([^/?#]+)/);
+  if (match?.[1] && match?.[2]) {
+    return {
+      remoteId: `${match[1]}:${match[2]}`,
+      normalizedUrl: raw.split(/[?#]/)[0].replace(/\/+$/, ""),
+    };
+  }
+  return {
+    remoteId: raw.split(/[?#]/)[0].split("/").filter(Boolean).pop() || raw,
+    normalizedUrl: raw.split(/[?#]/)[0].replace(/\/+$/, ""),
+  };
+}
+
 function resolveAssetUrl(url, baseUrl) {
   if (typeof url !== "string") {
     return "";
@@ -289,7 +341,7 @@ function canonicalRemoteId(item) {
   }
   try {
     const parsed = new URL(item.sourceUrl || rawRemoteId);
-    const match = parsed.pathname.match(/\/(article|video|w)\/([^/?#]+)/);
+    const match = parsed.pathname.match(/\/(article|video|w|note)\/([^/?#]+)/);
     if (match?.[1] && match?.[2]) {
       return `${match[1]}:${match[2]}`;
     }
@@ -310,7 +362,7 @@ function legacyRemoteIds(item) {
   }
   try {
     const parsed = new URL(item.sourceUrl || "");
-    const match = parsed.pathname.match(/\/(article|video|w)\/([^/?#]+)/);
+    const match = parsed.pathname.match(/\/(article|video|w|note)\/([^/?#]+)/);
     if (match?.[2]) {
       legacyIds.add(match[2]);
     }
@@ -370,7 +422,62 @@ async function findToutiaoPage(browser) {
   return page;
 }
 
-async function detectLoginState(page) {
+async function findDouyinPage(browser, source) {
+  const targetUrl = douyinListUrl(source);
+  let reusablePage = null;
+  for (const context of browser.contexts()) {
+    for (const page of context.pages()) {
+      const url = page.url();
+      if (url.includes("douyin.com")) {
+        await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
+        return page;
+      }
+      if (
+        !reusablePage &&
+        (url === "about:blank" || (!url.startsWith("devtools://") && !url.startsWith("chrome://") && !url.startsWith("chrome-extension://")))
+      ) {
+        reusablePage = page;
+      }
+    }
+  }
+  const context = browser.contexts()[0] ?? (await browser.newContext());
+  const page = reusablePage || (await context.newPage());
+  await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
+  return page;
+}
+
+async function findSourcePage(browser, source) {
+  return isDouyinSource(source) ? findDouyinPage(browser, source) : findToutiaoPage(browser);
+}
+
+async function detectLoginState(page, source = "favorites") {
+  if (isDouyinSource(source)) {
+    return page.evaluate(() => {
+      const url = location.href;
+      const title = document.title || "";
+      const bodyText = (document.body?.innerText || "").replace(/\s+/g, " ");
+      const loginUrl = /login|passport|sso/i.test(url);
+      const loginText = /登录后|请先登录|扫码登录|手机登录|验证码登录|账号登录|立即登录/.test(bodyText);
+      const visibleLoginButtons = Array.from(document.querySelectorAll("a, button, [role='button'], div, span"))
+        .map((element) => {
+          const text = (element.textContent || "").replace(/\s+/g, " ").trim();
+          const rect = element.getBoundingClientRect();
+          return { text, top: rect.top, width: rect.width, height: rect.height };
+        })
+        .filter((item) => item.top >= 0 && item.top < 360 && item.width > 0 && item.height > 0)
+        .some((item) => ["登录", "立即登录"].includes(item.text) || /登录后|请先登录/.test(item.text));
+      const loginRequired = loginUrl || loginText || visibleLoginButtons;
+      return {
+        url,
+        title,
+        isLoggedIn: !loginRequired && url.includes("douyin.com"),
+        loginRequired,
+        hasProfileEntry: url.includes("/user/self"),
+        hasSourceEntry: url.includes("showTab="),
+        bodyPreview: bodyText.slice(0, 180),
+      };
+    });
+  }
   return page.evaluate(() => {
     const url = location.href;
     const title = document.title || "";
@@ -409,26 +516,30 @@ async function detectLoginState(page) {
 }
 
 async function ensureLoggedIn(page, source) {
-  let loginState = await detectLoginState(page);
+  let loginState = await detectLoginState(page, source);
   if (loginState.isLoggedIn && !loginState.loginRequired) {
     return loginState;
   }
 
-  emitProgress("未检测到今日头条登录状态，已打开登录页；请在 Chrome 完成登录，程序会自动继续", {
+  emitProgress(`未检测到${platformLabel(source)}登录状态，已打开登录页；请在 Chrome 完成登录，程序会自动继续`, {
     pageUrl: loginState.url,
     pageTitle: loginState.title,
   });
 
-  if (!page.url().includes("toutiao.com") || /login|passport|sso/i.test(page.url())) {
+  if (isDouyinSource(source)) {
+    if (!page.url().includes("douyin.com") || /login|passport|sso/i.test(page.url())) {
+      await page.goto(douyinListUrl(source), { waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
+    }
+  } else if (!page.url().includes("toutiao.com") || /login|passport|sso/i.test(page.url())) {
     await page.goto("https://www.toutiao.com/", { waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
   }
 
   const startedAt = Date.now();
   while (Date.now() - startedAt < 180000) {
     await sleep(2500);
-    loginState = await detectLoginState(page);
+    loginState = await detectLoginState(page, source);
     if (loginState.isLoggedIn && !loginState.loginRequired) {
-      emitProgress(`已检测到登录，继续跳转到${source === "likes" ? "喜欢" : "收藏"}列表`, {
+      emitProgress(`已检测到登录，继续跳转到${sourceLabel(source)}列表`, {
         pageUrl: loginState.url,
         pageTitle: loginState.title,
       });
@@ -436,19 +547,22 @@ async function ensureLoggedIn(page, source) {
     }
   }
 
-  throw new Error("未登录：请在调试 Chrome 中完成今日头条登录后重试。登录完成后程序会自动进入收藏/喜欢列表。");
+  throw new Error(`未登录：请在调试 Chrome 中完成${platformLabel(source)}登录后重试。登录完成后程序会自动进入${sourceKindLabel(source)}列表。`);
 }
 
 async function emitLoginStatus(page, source) {
-  if (!page.url().includes("toutiao.com")) {
+  if (isDouyinSource(source) && !page.url().includes("douyin.com")) {
+    await page.goto(douyinListUrl(source), { waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
+  } else if (!isDouyinSource(source) && !page.url().includes("toutiao.com")) {
     await page.goto("https://www.toutiao.com/", { waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
   }
   await page.waitForTimeout(1800);
-  let loginState = await detectLoginState(page);
-  if (!loginState.isLoggedIn && !loginState.url.includes("toutiao.com")) {
-    await page.goto("https://www.toutiao.com/", { waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
+  let loginState = await detectLoginState(page, source);
+  const expectedHost = isDouyinSource(source) ? "douyin.com" : "toutiao.com";
+  if (!loginState.isLoggedIn && !loginState.url.includes(expectedHost)) {
+    await page.goto(isDouyinSource(source) ? douyinListUrl(source) : "https://www.toutiao.com/", { waitUntil: "domcontentloaded", timeout: 120000 }).catch(() => {});
     await page.waitForTimeout(1800);
-    loginState = await detectLoginState(page);
+    loginState = await detectLoginState(page, source);
   }
   const loggedIn = loginState.isLoggedIn && !loginState.loginRequired;
   if (loggedIn) {
@@ -463,14 +577,61 @@ async function emitLoginStatus(page, source) {
     loginRequired: !loggedIn,
     source,
     message: loggedIn
-      ? "已登录今日头条，可以同步"
-      : "未登录：请在大家的chrome浏览器中登录，登录后点击“刷新”",
+      ? `已登录${platformLabel(source)}，可以同步`
+      : `未登录：请在 Chrome 浏览器中登录${platformLabel(source)}，登录后点击“刷新”`,
     pageUrl: loginState.url,
     pageTitle: loginState.title,
   });
 }
 
+async function inspectDouyinPage(page, source) {
+  await page.waitForTimeout(800);
+  const info = await page.evaluate((currentSource) => {
+    const wantedTab = String(currentSource || "").endsWith("likes") ? "like" : "favorite_collection";
+    const bodyText = document.body?.innerText || "";
+    const title = document.title || "";
+    const url = location.href;
+    const params = new URLSearchParams(location.search);
+    const anchors = Array.from(document.querySelectorAll("a[href]"))
+      .map((anchor) => ({
+        href: anchor.href || "",
+        text: (anchor.textContent || anchor.getAttribute("title") || anchor.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim(),
+      }))
+      .filter((item) => item.href.includes("douyin.com") && /\/(video|note)\//.test(item.href));
+    const activeTab =
+      params.get("showTab") === "like"
+        ? "点赞"
+        : params.get("showTab") === "favorite_collection"
+          ? "收藏"
+          : "";
+    const matchedKeyword =
+      params.get("showTab") === wantedTab
+        ? `showTab=${wantedTab}`
+        : (wantedTab === "like" ? ["点赞", "喜欢"] : ["收藏"]).find((keyword) => title.includes(keyword) || bodyText.includes(keyword)) || "";
+    return {
+      url,
+      title,
+      activeTab,
+      bodyPreview: bodyText.replace(/\s+/g, " ").slice(0, 300),
+      matchedKeyword,
+      toutiaoAnchorCount: 0,
+      contentAnchorCount: anchors.length,
+      cardCount: anchors.length,
+      sampleUrls: anchors.slice(0, 5).map((item) => item.href),
+    };
+  }, source);
+
+  emitProgress(
+    `页面诊断：${sourceLabel(source)}，当前标签“${info.activeTab || "未知"}”，标题“${info.title}”，内容链接 ${info.contentAnchorCount} 个`,
+    { pageUrl: info.url, pageTitle: info.title },
+  );
+  return info;
+}
+
 async function inspectCurrentPage(page, source) {
+  if (isDouyinSource(source)) {
+    return inspectDouyinPage(page, source);
+  }
   await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" }));
   await page.waitForTimeout(400);
   const info = await page.evaluate((currentSource) => {
@@ -562,6 +723,10 @@ async function inspectCurrentPage(page, source) {
 }
 
 async function switchToSourceTab(page, source) {
+  if (isDouyinSource(source)) {
+    await page.goto(douyinListUrl(source), { waitUntil: "domcontentloaded", timeout: 120000 });
+    return { text: sourceKindLabel(source), href: douyinListUrl(source) };
+  }
   await page.evaluate(() => window.scrollTo({ top: 0, behavior: "instant" }));
   await page.waitForTimeout(400);
   const labels = source === "likes" ? ["喜欢", "赞过", "点赞"] : ["收藏", "我的收藏"];
@@ -607,6 +772,9 @@ async function switchToSourceTab(page, source) {
 }
 
 async function findSourceListEntry(page, source) {
+  if (isDouyinSource(source)) {
+    return { href: douyinListUrl(source), text: sourceLabel(source), keyword: sourceKindLabel(source), score: 999 };
+  }
   return page.evaluate((currentSource) => {
     const keywords = currentSource === "likes" ? ["喜欢", "赞过", "点赞"] : ["收藏", "我的收藏", "favorite"];
     const anchors = Array.from(document.querySelectorAll("a[href]"));
@@ -666,6 +834,9 @@ async function findSourceListEntry(page, source) {
 }
 
 function normalizeSourceListUrl(url, source) {
+  if (isDouyinSource(source)) {
+    return douyinListUrl(source);
+  }
   const tab = source === "likes" ? "digg" : "fav";
   try {
     const rawUrl = String(url);
@@ -715,6 +886,15 @@ async function resetAllScrollToTop(page) {
 }
 
 function isOnTargetList(info, source) {
+  if (isDouyinSource(source)) {
+    try {
+      const parsed = new URL(info.url);
+      const showTab = (parsed.searchParams.get("showTab") || "").toLowerCase();
+      return parsed.hostname.includes("douyin.com") && showTab === (sourceKind(source) === "likes" ? "like" : "favorite_collection");
+    } catch {
+      return false;
+    }
+  }
   const activeTab = info.activeTab || "";
   if (source === "favorites") {
     return activeTab === "收藏";
@@ -731,6 +911,18 @@ function isOnTargetList(info, source) {
 }
 
 function assertPageLooksRight(info, source) {
+  if (isDouyinSource(source)) {
+    if (!info.url.includes("douyin.com")) {
+      throw new Error(`当前标签页不是抖音页面：${info.url}`);
+    }
+    if (!isOnTargetList(info, source)) {
+      throw new Error(`当前不是“${sourceLabel(source)}”列表页；标题：${info.title || "无"}；地址：${info.url}`);
+    }
+    if (!info.matchedKeyword) {
+      throw new Error(`当前页面不像“${sourceLabel(source)}”列表页。未命中对应关键词；标题：${info.title || "无"}；地址：${info.url}`);
+    }
+    return;
+  }
   if (!info.url.includes("toutiao.com")) {
     throw new Error(`当前标签页不是今日头条页面：${info.url}`);
   }
@@ -747,7 +939,335 @@ function assertPageLooksRight(info, source) {
   // 内容链接可能在懒加载后才出现；不要在诊断阶段中断，让后续滚动扫描决定继续或完成。
 }
 
+async function collectDouyinList(page, options = {}) {
+  const onDiscovered = typeof options.onDiscovered === "function" ? options.onDiscovered : null;
+  const knownRemoteIds = options.knownRemoteIds || options.known_remote_ids || [];
+  const knownSet = new Set((knownRemoteIds || []).map((item) => String(item)));
+  const stopOnKnownDuplicate = options.stopOnKnownDuplicate !== false && knownSet.size > 0;
+  const isKnownItem = (item) => Array.from(remoteIdentityCandidates(item)).some((id) => knownSet.has(id));
+  await page.bringToFront();
+  await resetAllScrollToTop(page);
+  await page.waitForTimeout(1800);
+
+  const readVisibleCards = async () =>
+    page.evaluate(() => {
+      const normalizeText = (value) => (value || "").replace(/\s+/g, " ").trim();
+      const isUsefulTitle = (value) =>
+        value &&
+        value.length >= 2 &&
+        value.length <= 120 &&
+        !/^(点赞|收藏|分享|评论|关注|推荐|首页|朋友|消息|我)$/.test(value) &&
+        !/^\d+(\.\d+)?万?$/.test(value);
+      const pickCard = (anchor) => {
+        const candidates = [
+          anchor.closest("li"),
+          anchor.closest("div[class]"),
+          anchor.parentElement,
+          anchor.closest("section"),
+          anchor.closest("[data-e2e]"),
+        ].filter(Boolean);
+        return candidates.find((node) => {
+          const rect = node.getBoundingClientRect();
+          const tagName = (node.tagName || "").toUpperCase();
+          const e2e = node.getAttribute?.("data-e2e") || "";
+          const itemLinks = Array.from(node.querySelectorAll?.("a[href]") || [])
+            .filter((item) => /\/(video|note)\//.test(item.getAttribute("href") || item.href || ""))
+            .length;
+          return (
+            tagName !== "UL" &&
+            tagName !== "OL" &&
+            e2e !== "scroll-list" &&
+            rect.width >= 90 &&
+            rect.height >= 90 &&
+            rect.width <= 460 &&
+            rect.height <= 760 &&
+            itemLinks <= 2
+          );
+        }) || anchor;
+      };
+      const pickMetric = (card) => {
+        const values = Array.from(card.querySelectorAll("span, div, p"))
+          .map((node) => normalizeText(node.textContent || ""))
+          .filter(Boolean);
+        return values.find((value) => /^\d+(\.\d+)?万?$/.test(value)) || "";
+      };
+      const contentIdentity = (sourceUrl) => {
+        try {
+          const parsed = new URL(sourceUrl);
+          const match = parsed.pathname.match(/\/(video|note)\/([^/?#]+)/);
+          if (match?.[1] && match?.[2]) {
+            return {
+              remoteId: `${match[1]}:${match[2]}`,
+              normalizedUrl: `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, ""),
+            };
+          }
+        } catch {
+          // Fall through to string parsing below.
+        }
+        const raw = String(sourceUrl || "");
+        const match = raw.match(/\/(video|note)\/([^/?#]+)/);
+        if (match?.[1] && match?.[2]) {
+          return {
+            remoteId: `${match[1]}:${match[2]}`,
+            normalizedUrl: raw.split(/[?#]/)[0].replace(/\/+$/, ""),
+          };
+        }
+        return {
+          remoteId: raw.split(/[?#]/)[0].split("/").filter(Boolean).pop() || raw,
+          normalizedUrl: raw.split(/[?#]/)[0].replace(/\/+$/, ""),
+        };
+      };
+      const pickTitle = (card, anchor) => {
+        const values = [
+          anchor.getAttribute("title"),
+          anchor.getAttribute("aria-label"),
+          anchor.textContent,
+          card.getAttribute?.("aria-label"),
+          ...Array.from(card.querySelectorAll("img[alt], [title], [aria-label], h1, h2, h3, p, span"))
+            .flatMap((node) => [node.getAttribute?.("alt"), node.getAttribute?.("title"), node.getAttribute?.("aria-label"), node.textContent]),
+        ].map(normalizeText).filter(isUsefulTitle);
+        return values.sort((left, right) => right.length - left.length)[0] || "";
+      };
+      const anchors = Array.from(document.querySelectorAll("a[href]"))
+        .filter((anchor) => {
+          const href = anchor.href || anchor.getAttribute("href") || "";
+          return href.includes("douyin.com") && /\/(video|note)\//.test(href);
+        });
+      const items = [];
+      for (const anchor of anchors) {
+        const anchorRect = anchor.getBoundingClientRect();
+        if (
+          anchorRect.width <= 0 ||
+          anchorRect.height <= 0 ||
+          anchorRect.bottom < 0 ||
+          anchorRect.top > window.innerHeight + 400
+        ) {
+          continue;
+        }
+        const card = pickCard(anchor);
+        const rect = card.getBoundingClientRect();
+        const tagName = (card.tagName || "").toUpperCase();
+        const e2e = card.getAttribute?.("data-e2e") || "";
+        const itemLinks = Array.from(card.querySelectorAll?.("a[href]") || [])
+          .filter((item) => /\/(video|note)\//.test(item.getAttribute("href") || item.href || ""))
+          .length;
+        if (rect.width <= 0 || rect.height <= 0 || rect.bottom < 0 || rect.top > window.innerHeight + 400) {
+          continue;
+        }
+        if (tagName === "UL" || tagName === "OL" || e2e === "scroll-list" || itemLinks > 2) {
+          continue;
+        }
+        const sourceUrl = anchor.href || anchor.getAttribute("href") || "";
+        const title = pickTitle(card, anchor) || `抖音内容 ${sourceUrl.split("/").filter(Boolean).pop() || ""}`.trim();
+        const media = card.querySelector("img[src], video[poster]") || anchor.querySelector("img[src], video[poster]");
+        const coverUrl =
+          media?.getAttribute?.("poster") ||
+          media?.currentSrc ||
+          media?.getAttribute?.("src") ||
+          "";
+        const contentType = sourceUrl.includes("/note/") ? "article" : "video";
+        const metricText = pickMetric(card);
+        const identity = contentIdentity(sourceUrl);
+        items.push({
+          remoteId: identity.remoteId,
+          absoluteTop: (window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0) + rect.top,
+          visualTop: rect.top,
+          visualBottom: rect.bottom,
+          title,
+          summary: normalizeText(card.textContent || title).slice(0, 220),
+          sourceUrl: identity.normalizedUrl || sourceUrl,
+          contentType,
+          coverUrl,
+          metricText,
+          listHtml: card.outerHTML || anchor.outerHTML || "",
+        });
+      }
+      return Array.from(new Map(
+        items
+          .sort((left, right) => left.absoluteTop - right.absoluteTop || left.visualTop - right.visualTop)
+          .map((item) => [item.remoteId || item.sourceUrl, item]),
+      ).values());
+    });
+
+  const seen = new Map();
+  let stopReason = "";
+  let stableRounds = 0;
+  let bottomRounds = 0;
+
+  const addDiscoveredItem = (item) => {
+    const key = normalizeUrl(item.sourceUrl);
+    if (seen.has(key)) {
+      return "seen";
+    }
+    if (stopOnKnownDuplicate && isKnownItem(item)) {
+      stopReason = `遇到已同步旧内容，停止滚动：${item.title} ${item.sourceUrl}`;
+      emitProgress(stopReason, {
+        candidates: seen.size,
+        pageUrl: item.sourceUrl,
+        pageTitle: item.title,
+      });
+      return "known";
+    }
+    const orderedItem = { ...item, listOrder: seen.size + 1 };
+    seen.set(key, orderedItem);
+    emitProgress(`发现内容 ${seen.size}: ${orderedItem.title} ${orderedItem.sourceUrl}`, {
+      candidates: seen.size,
+      pageUrl: orderedItem.sourceUrl,
+      pageTitle: orderedItem.title,
+    });
+    onDiscovered?.(orderedItem, seen.size);
+    return "added";
+  };
+
+  for (let index = 0; index < 9999999; index += 1) {
+    const beforeSize = seen.size;
+    for (const item of await readVisibleCards()) {
+      if (addDiscoveredItem(item) === "known") {
+        break;
+      }
+    }
+    if (stopReason) {
+      break;
+    }
+    const scrollStep = await page.evaluate(() => {
+      const linkCount = (node) =>
+        Array.from(node.querySelectorAll?.("a[href]") || [])
+          .filter((item) => /\/(video|note)\//.test(item.getAttribute("href") || item.href || ""))
+          .length;
+      const candidates = [
+        document.scrollingElement || document.documentElement,
+        document.documentElement,
+        document.body,
+        ...Array.from(document.querySelectorAll("[data-e2e='scroll-list'], main, section, div")),
+      ].filter(Boolean);
+      const scrollables = candidates
+        .map((node) => {
+          const isDocument = node === document.scrollingElement || node === document.documentElement || node === document.body;
+          const rect = isDocument
+            ? { top: 0, bottom: window.innerHeight, height: window.innerHeight, width: window.innerWidth }
+            : node.getBoundingClientRect();
+          const clientHeight = isDocument ? window.innerHeight : node.clientHeight;
+          const scrollHeight = isDocument
+            ? Math.max(document.documentElement.scrollHeight || 0, document.body.scrollHeight || 0)
+            : node.scrollHeight;
+          const maxScroll = Math.max(0, scrollHeight - clientHeight);
+          const links = linkCount(node);
+          const dataE2e = node.getAttribute?.("data-e2e") || "";
+          return {
+            node,
+            isDocument,
+            clientHeight,
+            scrollHeight,
+            maxScroll,
+            links,
+            visible: rect.height > 80 && rect.bottom > 0 && rect.top < window.innerHeight,
+            score: maxScroll + links * 2000 + (dataE2e === "scroll-list" ? 4000 : 0),
+          };
+        })
+        .filter((item) => item.visible && item.maxScroll > 80)
+        .sort((left, right) => right.score - left.score);
+      const target = scrollables[0] || { node: document.scrollingElement || document.documentElement, isDocument: true, clientHeight: window.innerHeight, scrollHeight: Math.max(document.documentElement.scrollHeight || 0, document.body.scrollHeight || 0), maxScroll: 0 };
+      const before = target.isDocument ? (window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0) : target.node.scrollTop;
+      const step = Math.max(850, Math.floor((target.clientHeight || window.innerHeight || 900) * 0.85));
+      if (target.isDocument) {
+        window.scrollBy(0, step);
+      } else {
+        target.node.scrollTop = Math.min(target.maxScroll, before + step);
+        target.node.dispatchEvent(new Event("scroll", { bubbles: true }));
+      }
+      const after = target.isDocument ? (window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0) : target.node.scrollTop;
+      return { before, after, moved: Math.abs(after - before) > 2, step, links: target.links || 0 };
+    });
+    await page.mouse.wheel(0, Math.max(650, Math.floor(800))).catch(() => {});
+    await page.waitForTimeout(2200);
+    const scrollInfo = await page.evaluate(() => {
+      const linkCount = (node) =>
+        Array.from(node.querySelectorAll?.("a[href]") || [])
+          .filter((item) => /\/(video|note)\//.test(item.getAttribute("href") || item.href || ""))
+          .length;
+      const candidates = [
+        document.scrollingElement || document.documentElement,
+        document.documentElement,
+        document.body,
+        ...Array.from(document.querySelectorAll("[data-e2e='scroll-list'], main, section, div")),
+      ].filter(Boolean);
+      const scrollables = candidates
+        .map((node) => {
+          const isDocument = node === document.scrollingElement || node === document.documentElement || node === document.body;
+          const rect = isDocument
+            ? { top: 0, bottom: window.innerHeight, height: window.innerHeight, width: window.innerWidth }
+            : node.getBoundingClientRect();
+          const clientHeight = isDocument ? window.innerHeight : node.clientHeight;
+          const scrollHeight = isDocument
+            ? Math.max(document.documentElement.scrollHeight || 0, document.body.scrollHeight || 0)
+            : node.scrollHeight;
+          const top = isDocument ? (window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0) : node.scrollTop;
+          const maxScroll = Math.max(0, scrollHeight - clientHeight);
+          const links = linkCount(node);
+          const dataE2e = node.getAttribute?.("data-e2e") || "";
+          return {
+            top,
+            scrollHeight,
+            clientHeight,
+            maxScroll,
+            links,
+            visible: rect.height > 80 && rect.bottom > 0 && rect.top < window.innerHeight,
+            score: maxScroll + links * 2000 + (dataE2e === "scroll-list" ? 4000 : 0),
+          };
+        })
+        .filter((item) => item.visible && item.maxScroll > 80)
+        .sort((left, right) => right.score - left.score);
+      const current = scrollables[0] || {
+        top: window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0,
+        scrollHeight: Math.max(document.documentElement.scrollHeight || 0, document.body.scrollHeight || 0),
+        clientHeight: window.innerHeight || document.documentElement.clientHeight || 0,
+        maxScroll: 0,
+        links: 0,
+      };
+      const bodyText = document.body?.innerText || "";
+      return {
+        ...current,
+        isAtBottom: current.top + current.clientHeight >= current.scrollHeight - 80,
+        endMarker: /暂无更多|没有更多|已加载全部|已经到底|到底了|暂无收藏|暂未收藏|还没有/.test(bodyText),
+      };
+    });
+    for (const item of await readVisibleCards()) {
+      if (addDiscoveredItem(item) === "known") {
+        break;
+      }
+    }
+    if (stopReason) {
+      break;
+    }
+    const grewThisRound = seen.size > beforeSize;
+    if (!grewThisRound) {
+      stableRounds += 1;
+    } else {
+      stableRounds = 0;
+    }
+    if (!grewThisRound && (scrollInfo.isAtBottom || scrollInfo.endMarker) && !scrollStep.moved) {
+      bottomRounds += 1;
+    } else {
+      bottomRounds = 0;
+    }
+    emitProgress(`滚动扫描 ${index + 1}：累计 ${seen.size}${scrollInfo.endMarker ? "，已到底" : ""}`, {
+      candidates: seen.size,
+      transient: true,
+    });
+    if (bottomRounds >= 4 || stableRounds >= 10 || (options.maxItems && seen.size >= options.maxItems)) {
+      break;
+    }
+  }
+
+  const results = Array.from(seen.values());
+  results.stopReason = stopReason;
+  return results;
+}
+
 async function collectList(page, options = {}) {
+  if (isDouyinSource(options.source)) {
+    return collectDouyinList(page, options);
+  }
   const onDiscovered = typeof options.onDiscovered === "function" ? options.onDiscovered : null;
   const knownRemoteIds = options.knownRemoteIds || options.known_remote_ids || [];
   const knownSet = new Set((knownRemoteIds || []).map((item) => String(item)));
@@ -1244,18 +1764,18 @@ async function collectProfile(page) {
 }
 
 function buildNoResultError(info, source) {
-  const sourceLabel = source === "likes" ? "喜欢" : "收藏";
+  const label = sourceLabel(source);
   const samples = info.sampleUrls.length ? info.sampleUrls.join(" | ") : "无";
   return [
-    `当前页面未识别到“${sourceLabel}”内容卡片。`,
+    `当前页面未识别到“${label}”内容卡片。`,
     `标题：${info.title || "无"}。`,
     `地址：${info.url}。`,
     `页面关键词命中：${info.matchedKeyword || "无"}。`,
-    `今日头条链接数：${info.toutiaoAnchorCount}。`,
+    `${platformLabel(source)}链接数：${info.toutiaoAnchorCount || info.contentAnchorCount || 0}。`,
     `内容链接数：${info.contentAnchorCount}。`,
     `页面文本预览：${info.bodyPreview || "无"}。`,
     `示例链接：${samples}。`,
-    `请先在 Chrome 打开今日头条${sourceLabel}列表页后再试。`,
+    `请先在 Chrome 打开${label}列表页后再试。`,
   ].join(" ");
 }
 
@@ -1868,7 +2388,7 @@ async function main() {
 
   emitProgress("连接 Chrome");
   const browser = await connectChrome(job);
-  const page = await findToutiaoPage(browser);
+  const page = await findSourcePage(browser, job.source);
   if (checkLogin) {
     await emitLoginStatus(page, job.source);
     await browser.close();
@@ -1877,6 +2397,9 @@ async function main() {
   await ensureLoggedIn(page, job.source);
 
   if (isDownloadMode) {
+    if (isDouyinSource(job.source)) {
+      throw new Error("抖音当前仅支持同步列表，暂未接入下载内容。");
+    }
     const downloadQueue = Array.isArray(job.downloadItems) ? job.downloadItems : [];
     emitProgress(`待下载内容 ${downloadQueue.length} 条；已下载内容会自动跳过；下载线程 ${job.downloadThreads}`, {
       candidates: downloadQueue.length,
@@ -1917,12 +2440,12 @@ async function main() {
         : normalizeSourceListUrl(entry.href, job.source)
       : buildSourceListUrl(pageInfo.url, job.source);
     emitProgress(
-      `当前不在${job.source === "likes" ? "喜欢" : "收藏"}列表页，尝试自动跳转：${entry?.text || targetUrl}`,
+      `当前不在${sourceLabel(job.source)}列表页，尝试自动跳转：${entry?.text || targetUrl}`,
       { pageUrl: pageInfo.url, pageTitle: pageInfo.title },
     );
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
     await page.waitForTimeout(2500);
-    const loginState = await detectLoginState(page);
+    const loginState = await detectLoginState(page, job.source);
     if (loginState.loginRequired && !loginState.isLoggedIn) {
       await ensureLoggedIn(page, job.source);
       await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
@@ -1933,7 +2456,7 @@ async function main() {
   assertPageLooksRight(pageInfo, job.source);
 
   const normalizedListUrl = normalizeSourceListUrl(page.url(), job.source);
-  emitProgress(`重新载入${job.source === "likes" ? "喜欢" : "收藏"}列表顶部：${normalizedListUrl}`, {
+  emitProgress(`重新载入${sourceLabel(job.source)}列表顶部：${normalizedListUrl}`, {
     pageUrl: pageInfo.url,
     pageTitle: pageInfo.title,
   });
@@ -1950,10 +2473,12 @@ async function main() {
 
   let streamedListSaved = 0;
   const streamedListUrls = new Set();
-  emitProgress(`扫描当前今日头条${job.source === "likes" ? "喜欢" : "收藏"}页面，已知旧内容 ${job.knownRemoteIds.length} 个`);
+  emitProgress(`扫描当前${sourceLabel(job.source)}页面，已知旧内容 ${job.knownRemoteIds.length} 个`);
   const list = await collectList(page, {
+    source: job.source,
+    maxItems: job.maxItems,
     knownRemoteIds: job.knownRemoteIds,
-    stopOnKnownDuplicate: !isDownloadMode,
+    stopOnKnownDuplicate: !isDownloadMode && (!isListMode || isDouyinSource(job.source)),
     onDiscovered: isListMode
       ? (item) => {
           if (streamedListUrls.has(item.sourceUrl)) {
@@ -1980,7 +2505,7 @@ async function main() {
       await browser.close();
       return;
     }
-    emitProgress(`当前${job.source === "likes" ? "喜欢" : "收藏"}列表未发现可同步内容，按已完成处理`, {
+    emitProgress(`当前${sourceLabel(job.source)}列表未发现可同步内容，按已完成处理`, {
       candidates: 0,
       skipped: 0,
       discovered: 0,
@@ -2017,8 +2542,8 @@ async function main() {
     : isListMode
       ? list
       : candidates;
-  const skipped = list.length - candidates.length;
-  const discovered = isListMode ? candidates.length : selectedCandidates.length;
+  const skipped = isListMode ? 0 : list.length - candidates.length;
+  const discovered = selectedCandidates.length;
   emitProgress(`${isDownloadMode ? "待下载" : "识别到"} ${list.length} 条候选内容，跳过 ${skipped} 条，${isListMode ? "刷新列表" : isDownloadMode ? "待下载" : "新增"} ${selectedCandidates.length} 条`, {
     candidates: list.length,
     skipped,

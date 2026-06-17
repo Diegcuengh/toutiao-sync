@@ -1,4 +1,4 @@
-export type SyncSource = "favorites" | "likes";
+export type SyncSource = "favorites" | "likes" | "douyin_favorites" | "douyin_likes";
 export type ContentTypeFilter = "all" | "article" | "video";
 export type DownloadStatusFilter = "downloaded" | "pending" | "failed";
 

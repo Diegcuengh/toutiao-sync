@@ -26,6 +26,9 @@ import {
 } from "./lib/api";
 import type { AppBootstrap, ContentItem, DownloadStatusFilter, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncSource, TagOption, UserProfile } from "./types";
 
+type SyncPlatform = "toutiao" | "douyin";
+type SourceKind = "favorites" | "likes";
+
 const bootstrap = ref<AppBootstrap | null>(null);
 const sessions = ref<SyncSession[]>([]);
 const events = ref<SyncEvent[]>([]);
@@ -41,6 +44,7 @@ const loading = ref(false);
 const syncing = ref(false);
 const loginChecking = ref(false);
 const activeTab = ref<"history" | "logs" | "local">("local");
+const syncPlatform = ref<SyncPlatform>("toutiao");
 const syncSource = ref<SyncSource>("favorites");
 const searchSource = ref<"all" | SyncSource>("favorites");
 const selectedSessionId = ref<string>("");
@@ -56,18 +60,37 @@ let refreshInFlight = false;
 let lastItemRefreshAt = 0;
 const ITEM_REFRESH_INTERVAL_MS = 1_000;
 const PAGE_SIZE = 50;
+const DOUYIN_PAGE_SIZE = 20;
 const originalHtmlCache = new Map<string, string>();
 
 const latestSession = computed(() => sessions.value[0] ?? null);
 const effectiveSessionId = computed(() => selectedSessionId.value || latestSession.value?.id || "");
 const runningSession = computed(() => sessions.value.find((session) => session.status === "running") ?? null);
 const visibleProfile = computed(() => (loginStatus.value?.loggedIn ? profile.value : null));
+const currentPlatformLabel = computed(() => (syncPlatform.value === "toutiao" ? "今日头条" : "抖音"));
 const canSync = computed(() => Boolean(loginStatus.value?.loggedIn) && !loginChecking.value && !syncing.value);
-const pageCount = computed(() => Math.max(1, Math.ceil(totalItems.value / PAGE_SIZE)));
-const pageStart = computed(() => (totalItems.value ? (currentPage.value - 1) * PAGE_SIZE + 1 : 0));
-const pageEnd = computed(() => Math.min(currentPage.value * PAGE_SIZE, totalItems.value));
-const systemTags = new Set(["所有", "视频", "文章", "已下载", "未下载", "下载失败"]);
+const canDownloadContent = computed(() => canSync.value && !isDouyinSource(syncSource.value));
+const activePageSize = computed(() => (searchSource.value !== "all" && isDouyinSource(syncSource.value) ? DOUYIN_PAGE_SIZE : PAGE_SIZE));
+const pageCount = computed(() => Math.max(1, Math.ceil(totalItems.value / activePageSize.value)));
+const pageStart = computed(() => (totalItems.value ? (currentPage.value - 1) * activePageSize.value + 1 : 0));
+const pageEnd = computed(() => Math.min(currentPage.value * activePageSize.value, totalItems.value));
+const platformTags = new Set(["今日头条", "抖音"]);
+const kindTags = new Set(["收藏", "点赞"]);
+const systemTags = new Set(["所有", "视频", "文章", "已下载", "未下载", "下载失败", ...platformTags, ...kindTags]);
 const semanticTagFilters = computed(() => selectedTags.value.filter((tag) => !systemTags.has(tag)));
+const platformTagOptions = computed<TagOption[]>(() => {
+  return [
+    { name: "今日头条", count: -1 },
+    { name: "抖音", count: -1 },
+    { name: "收藏", count: -1 },
+    { name: "点赞", count: -1 },
+  ];
+});
+const displayTagOptions = computed<TagOption[]>(() => {
+  const allOption = tagOptions.value.find((tag) => tag.name === "所有") ?? { name: "所有", count: totalItems.value };
+  const restOptions = tagOptions.value.filter((tag) => tag.name !== "所有" && !platformTags.has(tag.name) && !kindTags.has(tag.name));
+  return [allOption, ...platformTagOptions.value, ...restOptions];
+});
 const contentTypeFilter = computed(() => {
   const wantsVideo = selectedTags.value.includes("视频");
   const wantsArticle = selectedTags.value.includes("文章");
@@ -86,15 +109,62 @@ const downloadStatusFilter = computed<DownloadStatusFilter | undefined>(() => {
 });
 const renderedItems = computed(() =>
   items.value.map((item) => {
+    const isDouyin = isDouyinSource(item.source as SyncSource);
     const originalHtml = getOriginalCardHtml(item);
     return {
       item,
+      isDouyin,
       originalHtml,
       originalLine: originalHtml ? "" : getOriginalLine(item),
       listImage: originalHtml ? "" : getListImage(item),
     };
   }),
 );
+const isDouyinView = computed(() => searchSource.value !== "all" && isDouyinSource(syncSource.value));
+
+function makeSource(platform: SyncPlatform, kind: SourceKind): SyncSource {
+  if (platform === "douyin") {
+    return kind === "likes" ? "douyin_likes" : "douyin_favorites";
+  }
+  return kind;
+}
+
+function sourcePlatform(source: SyncSource): SyncPlatform {
+  return source.startsWith("douyin_") ? "douyin" : "toutiao";
+}
+
+function sourceKind(source: SyncSource): SourceKind {
+  return source.endsWith("likes") ? "likes" : "favorites";
+}
+
+function sourceLabel(source: SyncSource) {
+  const platform = sourcePlatform(source) === "douyin" ? "抖音" : "今日头条";
+  const kind = sourceKind(source) === "likes" ? "点赞" : "收藏";
+  return `${platform}${kind}`;
+}
+
+function isDouyinSource(source: SyncSource) {
+  return source.startsWith("douyin_");
+}
+
+function isTagActive(tag: string) {
+  if (tag === "所有") {
+    return !selectedTags.value.length && searchSource.value === "all";
+  }
+  if (tag === "今日头条") {
+    return sourcePlatform(syncSource.value) === "toutiao";
+  }
+  if (tag === "抖音") {
+    return sourcePlatform(syncSource.value) === "douyin";
+  }
+  if (tag === "收藏") {
+    return sourceKind(syncSource.value) === "favorites" && searchSource.value !== "all";
+  }
+  if (tag === "点赞") {
+    return sourceKind(syncSource.value) === "likes" && searchSource.value !== "all";
+  }
+  return selectedTags.value.includes(tag);
+}
 
 function parseRawJson(item: ContentItem) {
   try {
@@ -134,6 +204,19 @@ function getListImage(item: ContentItem) {
   return media?.getAttribute("poster") || media?.getAttribute("src") || item.coverUrl || "";
 }
 
+function getDouyinMetric(item: ContentItem) {
+  const raw = parseRawJson(item);
+  const direct = raw?.list?.metricText;
+  const nested = raw?.list?.raw?.list?.metricText;
+  const value = typeof direct === "string" ? direct : typeof nested === "string" ? nested : "";
+  return value.trim();
+}
+
+function openExternal(url: string) {
+  if (!url) return;
+  window.open(url, "_blank", "noreferrer");
+}
+
 function getOriginalLine(item: ContentItem) {
   const text = getListText(item);
   return text.replace(item.title, "").trim().slice(0, 80);
@@ -154,6 +237,10 @@ function getOriginalCardHtml(item: ContentItem) {
   const cached = originalHtmlCache.get(cacheKey);
   if (cached !== undefined) {
     return cached;
+  }
+  if (isDouyinSource(item.source as SyncSource)) {
+    originalHtmlCache.set(cacheKey, "");
+    return "";
   }
   const raw = parseRawJson(item);
   const html = getRawListHtml(raw);
@@ -230,21 +317,28 @@ function getOriginalCardHtml(item: ContentItem) {
 
 async function loadItems() {
   if (searchSource.value === "all") {
-    items.value = [];
-    totalItems.value = 0;
-    currentPage.value = 1;
-    lastItemRefreshAt = Date.now();
-    return;
+    const selectedPlatform =
+      selectedTags.value.includes("今日头条") && !selectedTags.value.includes("抖音")
+        ? "toutiao"
+        : selectedTags.value.includes("抖音") && !selectedTags.value.includes("今日头条")
+          ? "douyin"
+          : syncPlatform.value;
+    const selectedKind =
+      selectedTags.value.includes("收藏") && !selectedTags.value.includes("点赞")
+        ? "favorites"
+        : selectedTags.value.includes("点赞") && !selectedTags.value.includes("收藏")
+          ? "likes"
+          : sourceKind(syncSource.value);
+    searchSource.value = makeSource(selectedPlatform, selectedKind);
   }
-  const source = searchSource.value === "likes" ? "likes" : "favorites";
   const result = await searchItemsWithType(
     query.value,
-    source,
+    searchSource.value,
     contentTypeFilter.value,
     semanticTagFilters.value,
     downloadStatusFilter.value,
     currentPage.value,
-    PAGE_SIZE,
+    activePageSize.value,
   );
   items.value = result.items;
   totalItems.value = result.total;
@@ -258,7 +352,7 @@ async function loadItems() {
 
 async function loadTagOptions() {
   if (searchSource.value === "all") {
-    tagOptions.value = [];
+    tagOptions.value = await listTags();
     return;
   }
   tagOptions.value = await listTags(searchSource.value);
@@ -342,7 +436,10 @@ async function handleSync() {
 }
 
 async function handleDownloadContent() {
-  if (!canSync.value) {
+  if (!canDownloadContent.value) {
+    if (isDouyinSource(syncSource.value)) {
+      error.value = "抖音当前仅支持同步列表，暂未接入下载内容。";
+    }
     return;
   }
   syncing.value = true;
@@ -463,6 +560,26 @@ function toggleTag(tag: string) {
     void handleSearch();
     return;
   }
+  if (tag === "今日头条" || tag === "抖音") {
+    syncPlatform.value = tag === "抖音" ? "douyin" : "toutiao";
+    syncSource.value = makeSource(syncPlatform.value, sourceKind(syncSource.value));
+    if (searchSource.value !== "all") {
+      searchSource.value = syncSource.value;
+    }
+    selectedTags.value = selectedTags.value.filter((value) => !platformTags.has(value));
+    selectedTags.value.push(tag);
+    void handleSearch();
+    return;
+  }
+  if (tag === "收藏" || tag === "点赞") {
+    const kind = tag === "点赞" ? "likes" : "favorites";
+    syncSource.value = makeSource(syncPlatform.value, kind);
+    searchSource.value = syncSource.value;
+    selectedTags.value = selectedTags.value.filter((value) => !kindTags.has(value));
+    selectedTags.value.push(tag);
+    void handleSearch();
+    return;
+  }
   const selected = new Set(selectedTags.value);
   if (selected.has(tag)) {
     selected.delete(tag);
@@ -485,8 +602,13 @@ function selectSearchSource(source: "all" | SyncSource) {
   currentPage.value = 1;
   if (source !== "all") {
     syncSource.value = source;
+    syncPlatform.value = sourcePlatform(source);
   }
   void handleSearch();
+}
+
+function selectSearchKind(kind: SourceKind) {
+  selectSearchSource(makeSource(syncPlatform.value, kind));
 }
 
 async function goToPage(page: number) {
@@ -572,6 +694,19 @@ watch(syncSource, () => {
   profile.value = null;
 });
 
+watch(syncPlatform, () => {
+  syncSource.value = makeSource(syncPlatform.value, sourceKind(syncSource.value));
+  if (searchSource.value !== "all") {
+    searchSource.value = syncSource.value;
+  }
+  currentPage.value = 1;
+  loginStatus.value = null;
+  diagnosis.value = null;
+  profile.value = null;
+  error.value = "";
+  void handleSearch();
+});
+
 watch(searchSource, () => {
   selectedTags.value = [];
 });
@@ -617,15 +752,15 @@ onBeforeUnmount(() => {
   <main class="layout">
     <section class="top-toolbar">
       <img :src="appLogo" alt="今日收藏" class="toolbar-logo" />
-      <select v-model="syncSource">
-        <option value="favorites">同步收藏</option>
-        <option value="likes">同步喜欢</option>
+      <select v-model="syncPlatform" aria-label="选择同步平台">
+        <option value="toutiao">今日头条</option>
+        <option value="douyin">抖音</option>
       </select>
       <button :disabled="!canSync" @click="handleSync">
         {{ syncing ? "同步中..." : "同步列表" }}
       </button>
       <button v-if="syncing" class="danger" @click="handleStopSync">停止同步</button>
-      <button class="secondary" :disabled="!canSync" @click="handleDownloadContent">下载内容</button>
+      <button class="secondary" :disabled="!canDownloadContent" @click="handleDownloadContent">下载内容</button>
       <button class="secondary" @click="handleDiagnose">诊断当前页面</button>
       <button class="secondary" @click="activeTab = 'history'">日志</button>
       <div class="toolbar-search">
@@ -689,7 +824,7 @@ onBeforeUnmount(() => {
     <section class="profile-shell">
       <div class="login-status" :class="{ ok: loginStatus?.loggedIn, danger: loginStatus?.loginRequired }">
         <strong>登录状态：{{ loginChecking ? "检查中..." : loginStatus?.loggedIn ? "已登录" : "未登录" }}</strong>
-        <span>{{ loginStatus?.message || "点击“刷新”会先打开 Chrome，再检查今日头条登录状态" }}</span>
+        <span>{{ loginStatus?.message || `点击“刷新”会先打开 Chrome，再检查${currentPlatformLabel}登录状态` }}</span>
         <button class="status-refresh" type="button" :disabled="loginChecking" @click="handleCheckLogin">
           {{ loginChecking ? "刷新中..." : "刷新" }}
         </button>
@@ -718,7 +853,7 @@ onBeforeUnmount(() => {
         </div>
         <p :class="diagnosis.ok ? 'hint' : 'error'">{{ diagnosis.message }}</p>
         <div class="meta-grid">
-          <span>来源：{{ diagnosis.source === "favorites" ? "收藏" : "喜欢" }}</span>
+          <span>来源：{{ sourceLabel(diagnosis.source) }}</span>
           <span>标题：{{ diagnosis.pageTitle || "无" }}</span>
           <span>地址：{{ diagnosis.pageUrl || "无" }}</span>
         </div>
@@ -729,7 +864,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-    <section class="content-shell">
+    <section class="content-shell" :class="{ 'douyin-mode': isDouyinView }">
       <div class="site-tabs" role="tablist" aria-label="同步内容">
         <button
           class="site-tab"
@@ -741,35 +876,35 @@ onBeforeUnmount(() => {
         </button>
         <button
           class="site-tab"
-          :class="{ active: activeTab === 'local' && searchSource === 'favorites' }"
+          :class="{ active: activeTab === 'local' && sourceKind(syncSource) === 'favorites' && searchSource !== 'all' }"
           role="tab"
-          :aria-selected="activeTab === 'local' && searchSource === 'favorites'"
-          @click="selectSearchSource('favorites')"
+          :aria-selected="activeTab === 'local' && sourceKind(syncSource) === 'favorites' && searchSource !== 'all'"
+          @click="selectSearchKind('favorites')"
         >
           收藏
         </button>
         <button
           class="site-tab"
-          :class="{ active: activeTab === 'local' && searchSource === 'likes' }"
+          :class="{ active: activeTab === 'local' && sourceKind(syncSource) === 'likes' && searchSource !== 'all' }"
           role="tab"
-          :aria-selected="activeTab === 'local' && searchSource === 'likes'"
-          @click="selectSearchSource('likes')"
+          :aria-selected="activeTab === 'local' && sourceKind(syncSource) === 'likes' && searchSource !== 'all'"
+          @click="selectSearchKind('likes')"
         >
-          喜欢
+          点赞
         </button>
       </div>
 
       <div class="tag-filter-bar" aria-label="内容标签筛选">
         <button
-          v-for="tag in tagOptions"
+          v-for="tag in displayTagOptions"
           :key="tag.name"
           class="tag-chip"
-          :class="{ active: tag.name === '所有' ? !selectedTags.length : selectedTags.includes(tag.name) }"
+          :class="{ active: isTagActive(tag.name) }"
           type="button"
           @click="toggleTag(tag.name)"
         >
           <span>{{ tag.name }}</span>
-          <small>{{ tag.count }}</small>
+          <small v-if="tag.count >= 0">{{ tag.count }}</small>
         </button>
       </div>
 
@@ -800,7 +935,7 @@ onBeforeUnmount(() => {
             <span v-if="loading">刷新中</span>
           </div>
           <div v-if="latestSession" class="latest">
-            <strong>{{ latestSession.source === "favorites" ? "收藏" : "喜欢" }}</strong>
+            <strong>{{ sourceLabel(latestSession.source) }}</strong>
             <span>{{ latestSession.status }}</span>
             <span>{{ latestSession.totalCandidates }} 条候选</span>
             <span>{{ latestSession.totalSkipped }} 条跳过</span>
@@ -831,7 +966,7 @@ onBeforeUnmount(() => {
                   @click="selectedSessionId = session.id"
                 >
                   <td>{{ session.startedAt }}</td>
-                  <td>{{ session.source === "favorites" ? "收藏" : "喜欢" }}</td>
+                  <td>{{ sourceLabel(session.source) }}</td>
                   <td>{{ session.status }}</td>
                   <td>{{ session.totalCandidates }}</td>
                   <td>{{ session.totalSkipped }}</td>
@@ -863,38 +998,57 @@ onBeforeUnmount(() => {
         </section>
 
         <section v-if="activeTab === 'local'" class="tab-pane">
-          <div class="toutiao-list">
-            <article v-for="entry in renderedItems" :key="entry.item.id" class="toutiao-item">
-              <div v-if="entry.originalHtml" class="toutiao-original-card" v-html="entry.originalHtml"></div>
-              <div v-else class="toutiao-body">
-                <h3>{{ entry.item.title }}</h3>
-                <p>{{ entry.originalLine }}</p>
-              </div>
-              <div v-if="!entry.originalHtml && entry.listImage" class="toutiao-thumb">
-                <img :src="entry.listImage" alt="" />
-                <span v-if="entry.item.contentType === 'video'" class="video-mark">▶</span>
-              </div>
-              <div class="toutiao-meta">
-                <span v-if="!entry.originalHtml" :title="entry.item.downloadError || ''">
-                  {{ getDownloadStatusText(entry.item) }}
-                </span>
-                <button
-                  v-if="entry.item.articlePath"
-                  class="link-button"
-                  @click="openItemFile(entry.item.id, 'article')"
-                >
-                  打开文章
-                </button>
-                <button
-                  v-if="entry.item.videoPath"
-                  class="link-button"
-                  @click="openItemFile(entry.item.id, 'video')"
-                >
-                  打开视频
-                </button>
-                <button class="link-button" @click="openItemDir(entry.item.id)">打开文件夹</button>
-                <button class="link-button danger-text" @click="handleDeleteItem(entry.item)">删除条目</button>
-              </div>
+          <div :class="isDouyinView ? 'douyin-list' : 'toutiao-list'">
+            <article
+              v-for="entry in renderedItems"
+              :key="entry.item.id"
+              :class="entry.isDouyin ? 'douyin-item' : 'toutiao-item'"
+            >
+              <template v-if="entry.isDouyin">
+                <a class="douyin-cover" :href="entry.item.sourceUrl" target="_blank" rel="noreferrer">
+                  <img v-if="entry.listImage" :src="entry.listImage" alt="" />
+                  <span v-else class="douyin-cover-fallback">{{ entry.item.contentType === 'video' ? '视频' : '图文' }}</span>
+                  <span class="douyin-metric">♡ {{ getDouyinMetric(entry.item) || '0' }}</span>
+                </a>
+                <a class="douyin-title" :href="entry.item.sourceUrl" target="_blank" rel="noreferrer">
+                  {{ entry.item.title }}
+                </a>
+                <div class="douyin-card-actions">
+                  <button class="link-button danger-text" @click="handleDeleteItem(entry.item)">删除条目</button>
+                </div>
+              </template>
+              <template v-else>
+                <div v-if="entry.originalHtml" class="toutiao-original-card" v-html="entry.originalHtml"></div>
+                <div v-else class="toutiao-body">
+                  <h3>{{ entry.item.title }}</h3>
+                  <p>{{ entry.originalLine }}</p>
+                </div>
+                <div v-if="!entry.originalHtml && entry.listImage" class="toutiao-thumb">
+                  <img :src="entry.listImage" alt="" />
+                  <span v-if="entry.item.contentType === 'video'" class="video-mark">▶</span>
+                </div>
+                <div class="toutiao-meta">
+                  <span v-if="!entry.originalHtml" :title="entry.item.downloadError || ''">
+                    {{ getDownloadStatusText(entry.item) }}
+                  </span>
+                  <button
+                    v-if="entry.item.articlePath"
+                    class="link-button"
+                    @click="openItemFile(entry.item.id, 'article')"
+                  >
+                    打开文章
+                  </button>
+                  <button
+                    v-if="entry.item.videoPath"
+                    class="link-button"
+                    @click="openItemFile(entry.item.id, 'video')"
+                  >
+                    打开视频
+                  </button>
+                  <button class="link-button" @click="openItemDir(entry.item.id)">打开文件夹</button>
+                  <button class="link-button danger-text" @click="handleDeleteItem(entry.item)">删除条目</button>
+                </div>
+              </template>
               <div class="item-tags">
                 <button
                   v-for="tag in entry.item.tags"
@@ -918,7 +1072,7 @@ onBeforeUnmount(() => {
             </article>
             <p v-if="!renderedItems.length" class="empty-state">暂无内容</p>
           </div>
-          <div v-if="totalItems > PAGE_SIZE" class="pagination" aria-label="收藏列表分页">
+          <div v-if="totalItems > activePageSize" class="pagination" aria-label="收藏列表分页">
             <span class="page-summary">第 {{ pageStart }}-{{ pageEnd }} 条 / 共 {{ totalItems }} 条</span>
             <div class="page-actions">
               <button class="secondary" type="button" :disabled="currentPage <= 1 || loading" @click="goToPage(1)">

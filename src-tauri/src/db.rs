@@ -1,5 +1,5 @@
 ﻿use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -122,6 +122,8 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
     ensure_column(&conn, "content_items", "list_run_id", "TEXT")?;
     ensure_column(&conn, "content_items", "download_error", "TEXT")?;
     migrate_legacy_remote_ids(&conn)?;
+    deduplicate_content_items(&conn)?;
+    deduplicate_douyin_scroll_list_items(&conn)?;
     restore_downloaded_list_metadata(&conn)?;
     repair_downloaded_article_bodies(&conn)?;
     classify_existing_items(&conn)?;
@@ -163,6 +165,12 @@ fn classify_text_tags(text: &str) -> Vec<String> {
         .filter(|tag| tag_rules(tag).iter().any(|keyword| haystack.contains(&keyword.to_lowercase())))
         .map(|tag| (*tag).to_string())
         .collect()
+}
+
+fn source_tags(source: &str) -> Vec<String> {
+    let platform = if source.starts_with("douyin_") { "抖音" } else { "今日头条" };
+    let kind = if source.ends_with("likes") { "点赞" } else { "收藏" };
+    vec![platform.to_string(), kind.to_string()]
 }
 
 fn insert_auto_tags(conn: &Connection, item_id: i64, tags: &[String]) -> Result<(), AppError> {
@@ -237,7 +245,7 @@ fn classify_existing_items(conn: &Connection) -> Result<(), AppError> {
 }
 
 fn canonical_remote_id_from_url(source_url: &str, fallback_type: &str, remote_id: &str) -> Option<String> {
-    for kind in ["article", "video", "w"] {
+    for kind in ["article", "video", "note", "w"] {
         let marker = format!("/{kind}/");
         if let Some(start) = source_url.find(&marker) {
             let rest = &source_url[start + marker.len()..];
@@ -261,7 +269,7 @@ fn canonical_remote_id_from_url(source_url: &str, fallback_type: &str, remote_id
 }
 
 fn bare_remote_id_from_url(source_url: &str) -> Option<String> {
-    for kind in ["article", "video", "w"] {
+    for kind in ["article", "video", "note", "w"] {
         let marker = format!("/{kind}/");
         if let Some(start) = source_url.find(&marker) {
             let rest = &source_url[start + marker.len()..];
@@ -391,6 +399,146 @@ fn migrate_legacy_remote_ids(conn: &Connection) -> Result<(), AppError> {
         }
     }
 
+    Ok(())
+}
+
+fn item_identity(remote_id: &str, source_url: &str, content_type: &str) -> Option<String> {
+    canonical_remote_id_from_url(source_url, content_type, remote_id)
+        .or_else(|| normalized_remote_url(source_url))
+        .or_else(|| {
+            let value = remote_id.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+}
+
+fn deduplicate_content_items(conn: &Connection) -> Result<(), AppError> {
+    #[derive(Clone)]
+    struct Row {
+        id: i64,
+        source: String,
+        remote_id: String,
+        identity: String,
+        list_order: Option<i64>,
+        synced_at: String,
+    }
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, source, remote_id, source_url, content_type, list_order, synced_at
+        FROM content_items
+        "#,
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+
+    let mut groups: BTreeMap<(String, String), Vec<Row>> = BTreeMap::new();
+    for row in rows {
+        let (id, source, remote_id, source_url, content_type, list_order, synced_at) = row?;
+        let Some(identity) = item_identity(&remote_id, &source_url, &content_type) else {
+            continue;
+        };
+        groups.entry((source.clone(), identity.clone())).or_default().push(Row {
+            id,
+            source,
+            remote_id,
+            identity,
+            list_order,
+            synced_at,
+        });
+    }
+    drop(stmt);
+
+    for (_, mut rows) in groups {
+        if rows.len() < 2 {
+            if let Some(row) = rows.first() {
+                if row.remote_id != row.identity {
+                    conn.execute(
+                        "UPDATE content_items SET remote_id = ?1 WHERE id = ?2",
+                        params![&row.identity, row.id],
+                    )?;
+                }
+            }
+            continue;
+        }
+
+        rows.sort_by(|left, right| {
+            left.list_order
+                .unwrap_or(i64::MAX)
+                .cmp(&right.list_order.unwrap_or(i64::MAX))
+                .then_with(|| right.synced_at.cmp(&left.synced_at))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        let keep = rows[0].clone();
+
+        for duplicate in rows.iter().skip(1) {
+            conn.execute(
+                r#"
+                UPDATE content_items
+                SET cover_path = COALESCE(cover_path, (SELECT cover_path FROM content_items WHERE id = ?2)),
+                    article_path = COALESCE(article_path, (SELECT article_path FROM content_items WHERE id = ?2)),
+                    video_path = COALESCE(video_path, (SELECT video_path FROM content_items WHERE id = ?2)),
+                    local_dir = COALESCE(local_dir, (SELECT local_dir FROM content_items WHERE id = ?2)),
+                    content_text = CASE
+                      WHEN content_text = '' THEN COALESCE((SELECT content_text FROM content_items WHERE id = ?2), '')
+                      ELSE content_text
+                    END
+                WHERE id = ?1
+                "#,
+                params![keep.id, duplicate.id],
+            )?;
+            conn.execute(
+                r#"
+                INSERT OR IGNORE INTO content_item_tags (item_id, tag, source, created_at)
+                SELECT ?1, tag, source, created_at
+                FROM content_item_tags
+                WHERE item_id = ?2
+                "#,
+                params![keep.id, duplicate.id],
+            )?;
+            conn.execute("DELETE FROM content_items WHERE id = ?1", params![duplicate.id])?;
+        }
+
+        if keep.remote_id != keep.identity {
+            conn.execute(
+                "UPDATE content_items SET remote_id = ?1 WHERE id = ?2",
+                params![&keep.identity, keep.id],
+            )?;
+        }
+        insert_auto_tags(conn, keep.id, &source_tags(&keep.source))?;
+    }
+
+    Ok(())
+}
+
+fn deduplicate_douyin_scroll_list_items(conn: &Connection) -> Result<(), AppError> {
+    conn.execute(
+        r#"
+        DELETE FROM content_items
+        WHERE source LIKE 'douyin_%'
+          AND (
+            raw_json LIKE '%"listHtml":"<ul %'
+            OR raw_json LIKE '%data-e2e=\"scroll-list\"%'
+            OR raw_json LIKE '%data-e2e="scroll-list"%'
+          )
+        "#,
+        [],
+    )?;
+    conn.execute(
+        r#"
+        DELETE FROM content_item_tags
+        WHERE item_id NOT IN (SELECT id FROM content_items)
+        "#,
+        [],
+    )?;
     Ok(())
 }
 
@@ -905,7 +1053,10 @@ pub fn update_session_progress(
 }
 
 pub fn upsert_item(conn: &Connection, source: &str, item: &ScriptItem, synced_at: &str) -> Result<(), AppError> {
-    if is_deleted_remote_item(conn, source, &item.remote_id, &item.source_url, &item.content_type)? {
+    let remote_id = item_identity(&item.remote_id, &item.source_url, &item.content_type)
+        .unwrap_or_else(|| item.remote_id.trim().to_string());
+
+    if is_deleted_remote_item(conn, source, &remote_id, &item.source_url, &item.content_type)? {
         return Ok(());
     }
 
@@ -937,7 +1088,7 @@ pub fn upsert_item(conn: &Connection, source: &str, item: &ScriptItem, synced_at
           synced_at = excluded.synced_at
         "#,
         params![
-            item.remote_id,
+            &remote_id,
             source,
             item.title,
             item.summary,
@@ -958,10 +1109,11 @@ pub fn upsert_item(conn: &Connection, source: &str, item: &ScriptItem, synced_at
     )?;
     let item_id = conn.query_row(
         "SELECT id FROM content_items WHERE source = ?1 AND remote_id = ?2",
-        params![source, &item.remote_id],
+        params![source, &remote_id],
         |row| row.get::<_, i64>(0),
     )?;
     classify_item_by_id(conn, item_id)?;
+    insert_auto_tags(conn, item_id, &source_tags(source))?;
     Ok(())
 }
 

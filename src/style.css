@@ -251,6 +251,13 @@ a {
   clip-path: inset(0 -100vmax);
 }
 
+.content-shell.douyin-mode {
+  background: #11131d;
+  color: #f6f7fb;
+  overflow-x: hidden;
+  box-shadow: 0 0 0 100vmax #11131d;
+}
+
 .site-tabs {
   display: grid;
   grid-template-columns: 92px 92px 92px 1fr;
@@ -258,6 +265,10 @@ a {
   height: 66px;
   border-bottom: 1px solid #e5e7eb;
   min-width: 760px;
+}
+
+.content-shell.douyin-mode .site-tabs {
+  border-bottom-color: transparent;
 }
 
 .tag-filter-bar {
@@ -268,6 +279,12 @@ a {
   padding: 14px 0 10px;
   border-bottom: 1px solid #eef0f4;
   background: #ffffff;
+}
+
+.content-shell.douyin-mode .tag-filter-bar {
+  background: #11131d;
+  border-bottom-color: transparent;
+  padding-top: 4px;
 }
 
 .tag-chip {
@@ -283,6 +300,13 @@ a {
   font-size: 14px;
 }
 
+.content-shell.douyin-mode .tag-chip {
+  border-color: #2b2e3a;
+  background: #2b2e3a;
+  color: #b7bac6;
+  font-weight: 700;
+}
+
 .tag-chip small {
   color: #94a3b8;
   font-size: 12px;
@@ -292,6 +316,12 @@ a {
   border-color: #ef4444;
   background: #fff1f2;
   color: #ef4444;
+}
+
+.content-shell.douyin-mode .tag-chip.active {
+  border-color: #3a2030;
+  background: #3a2030;
+  color: #ff2c55;
 }
 
 .tag-chip.active small {
@@ -307,9 +337,19 @@ a {
   font-size: 20px;
 }
 
+.content-shell.douyin-mode .site-tab {
+  color: #9296a3;
+  font-weight: 800;
+}
+
 .site-tab.active {
   color: #ef4444;
   box-shadow: inset 0 -3px 0 #ef4444;
+}
+
+.content-shell.douyin-mode .site-tab.active {
+  color: #f4f5fb;
+  box-shadow: inset 0 -3px 0 #fe2c55;
 }
 
 .site-search {
@@ -332,6 +372,10 @@ a {
 .content-panel {
   background: #ffffff;
   overflow-x: auto;
+}
+
+.content-shell.douyin-mode .content-panel {
+  background: #11131d;
 }
 
 .panel {
@@ -630,6 +674,127 @@ a {
   border-bottom: 1px solid #f3f4f6;
 }
 
+.douyin-list {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 245px));
+  gap: 30px 20px;
+  justify-content: space-between;
+  min-width: 0;
+  padding: 12px 0 40px;
+  background: #11131d;
+}
+
+.douyin-item {
+  width: 100%;
+  max-width: 245px;
+  min-width: 0;
+  color: #f6f7fb;
+}
+
+.douyin-cover {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  width: 100%;
+  aspect-ratio: 245 / 350;
+  border-radius: 8px;
+  background: #05060a;
+  color: #ffffff;
+  text-decoration: none;
+}
+
+.douyin-cover::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0;
+  height: 42%;
+  background: linear-gradient(180deg, rgba(5, 6, 10, 0), rgba(5, 6, 10, 0.62));
+  pointer-events: none;
+}
+
+.douyin-cover img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.douyin-cover-fallback {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #8f94a3;
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.douyin-metric {
+  position: absolute;
+  left: 10px;
+  bottom: 9px;
+  z-index: 1;
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: 800;
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.72);
+}
+
+.douyin-title {
+  display: -webkit-box;
+  margin: 9px 0 0;
+  height: calc(14px * 1.35 * 2);
+  overflow: hidden;
+  color: #cfd2dc;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.35;
+  text-decoration: none;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.douyin-title:hover {
+  color: #ffffff;
+}
+
+.douyin-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 22px;
+  margin-top: 7px;
+}
+
+.douyin-card-actions .link-button {
+  color: #9fa4b2;
+}
+
+.douyin-card-actions .danger-text {
+  color: #ff5d7f;
+}
+
+.douyin-item .item-tags {
+  padding: 8px 0 0;
+}
+
+.douyin-item .item-tag {
+  background: #252936;
+  color: #b7bac6;
+}
+
+.douyin-item .tag-add input {
+  border-color: #303442;
+  background: #161924;
+  color: #f6f7fb;
+}
+
+.douyin-item .tag-add button {
+  border-color: #303442;
+  background: #242836;
+  color: #cfd2dc;
+}
+
 .item-tags {
   display: flex;
   flex-wrap: wrap;
@@ -695,6 +860,26 @@ a {
   border-top: 1px solid #f3f4f6;
   color: #64748b;
   font-size: 14px;
+}
+
+.content-shell.douyin-mode .pagination {
+  background: #11131d;
+  border-top-color: #242836;
+  color: #9fa4b2;
+}
+
+.content-shell.douyin-mode .page-current {
+  color: #f4f5fb;
+}
+
+.content-shell.douyin-mode .page-actions button {
+  border-color: #303442;
+  background: #242836;
+  color: #cfd2dc;
+}
+
+.content-shell.douyin-mode .page-actions button:disabled {
+  opacity: 0.45;
 }
 
 .page-actions {

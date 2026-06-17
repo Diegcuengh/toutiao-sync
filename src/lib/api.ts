@@ -1,5 +1,5 @@
 ﻿import { invoke } from "@tauri-apps/api/core";
-import type { AppBootstrap, ContentItem, DiagnosePageRequest, DownloadStatusFilter, LoginStatus, PageDiagnosis, PagedContentItems, SyncEvent, SyncSession, SyncStartRequest, TagOption, UserProfile } from "../types";
+import type { AppBootstrap, ContentItem, DiagnosePageRequest, DownloadStatusFilter, LoginStatus, PageDiagnosis, PagedContentItems, SyncEvent, SyncSession, SyncSource, SyncStartRequest, TagOption, UserProfile } from "../types";
 
 function hasTauriRuntime() {
   if (typeof window === "undefined") {
@@ -83,14 +83,14 @@ export async function listSyncEvents(sessionId?: string): Promise<SyncEvent[]> {
   return safeInvoke("list_sync_events", { sessionId });
 }
 
-export async function searchItems(query: string, source?: "favorites" | "likes"): Promise<ContentItem[]> {
+export async function searchItems(query: string, source?: SyncSource): Promise<ContentItem[]> {
   const result = await searchItemsWithType(query, source);
   return result.items;
 }
 
 export async function searchItemsWithType(
   query: string,
-  source?: "favorites" | "likes",
+  source?: SyncSource,
   contentType?: "article" | "video",
   tagFilters?: string[],
   downloadStatus?: DownloadStatusFilter,
@@ -110,7 +110,7 @@ export async function getUserProfile(): Promise<UserProfile | null> {
   return safeInvoke("get_user_profile");
 }
 
-export async function listTags(source?: "favorites" | "likes"): Promise<TagOption[]> {
+export async function listTags(source?: SyncSource): Promise<TagOption[]> {
   if (!hasTauriRuntime()) {
     return [
       { name: "所有", count: 0 },
