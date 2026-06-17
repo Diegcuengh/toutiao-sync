@@ -203,6 +203,13 @@ pub fn remove_item_tag(state: State<'_, AppState>, item_id: i64, tag: String) ->
 }
 
 #[tauri::command]
+pub fn delete_content_item(state: State<'_, AppState>, item_id: i64) -> Result<(), AppError> {
+    log_command("delete_content_item");
+    let conn = db::connect(&state.db_path()?)?;
+    db::delete_content_item(&conn, item_id, &state.download_dir()?)
+}
+
+#[tauri::command]
 pub fn diagnose_page(
     state: State<'_, AppState>,
     request: DiagnosePageRequest,

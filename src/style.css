@@ -1015,6 +1015,10 @@ a {
   color: #60a5fa;
 }
 
+.link-button.danger-text {
+  color: #dc2626;
+}
+
 .badge.danger {
   background: #b91c1c;
 }

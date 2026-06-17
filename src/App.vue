@@ -7,6 +7,7 @@ import {
   bootstrapApp,
   checkToutiaoLogin,
   chooseDataDirectory,
+  deleteContentItem,
   diagnosePage,
   getUserProfile,
   launchDebugChrome,
@@ -532,6 +533,27 @@ async function handleClearSearch() {
   await handleSearch();
 }
 
+async function handleDeleteItem(item: ContentItem) {
+  const confirmed = window.confirm(`确认删除“${item.title}”？\n这会移除本地收藏记录，并删除已下载的本地文件。`);
+  if (!confirmed) {
+    return;
+  }
+  error.value = "";
+  try {
+    await deleteContentItem(item.id);
+    items.value = items.value.filter((candidate) => candidate.id !== item.id);
+    totalItems.value = Math.max(0, totalItems.value - 1);
+    originalHtmlCache.clear();
+    if (items.value.length === 0 && currentPage.value > 1) {
+      currentPage.value -= 1;
+    }
+    await loadTagOptions();
+    await loadItems();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
 watch(effectiveSessionId, async (value) => {
   if (!value) {
     events.value = [];
@@ -871,6 +893,7 @@ onBeforeUnmount(() => {
                   打开视频
                 </button>
                 <button class="link-button" @click="openItemDir(entry.item.id)">打开文件夹</button>
+                <button class="link-button danger-text" @click="handleDeleteItem(entry.item)">删除条目</button>
               </div>
               <div class="item-tags">
                 <button

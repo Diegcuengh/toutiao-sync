@@ -99,8 +99,18 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
           UNIQUE(item_id, tag)
         );
 
+        CREATE TABLE IF NOT EXISTS content_item_deletions (
+          source TEXT NOT NULL,
+          remote_id TEXT NOT NULL,
+          source_url TEXT NOT NULL DEFAULT '',
+          content_type TEXT NOT NULL DEFAULT '',
+          deleted_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+          UNIQUE(source, remote_id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_content_item_tags_item_id ON content_item_tags(item_id);
         CREATE INDEX IF NOT EXISTS idx_content_item_tags_tag ON content_item_tags(tag);
+        CREATE INDEX IF NOT EXISTS idx_content_item_deletions_source ON content_item_deletions(source);
         "#,
     )?;
 
@@ -895,6 +905,10 @@ pub fn update_session_progress(
 }
 
 pub fn upsert_item(conn: &Connection, source: &str, item: &ScriptItem, synced_at: &str) -> Result<(), AppError> {
+    if is_deleted_remote_item(conn, source, &item.remote_id, &item.source_url, &item.content_type)? {
+        return Ok(());
+    }
+
     conn.execute(
         r#"
         INSERT INTO content_items
@@ -1219,6 +1233,115 @@ pub fn remove_item_tag(conn: &Connection, item_id: i64, tag: &str) -> Result<Vec
     list_item_tags(conn, item_id)
 }
 
+pub fn delete_content_item(conn: &Connection, item_id: i64, download_dir: &Path) -> Result<(), AppError> {
+    let value = conn
+        .query_row(
+            r#"
+            SELECT source, remote_id, source_url, content_type, local_dir, article_path, video_path, cover_path
+            FROM content_items
+            WHERE id = ?1
+            "#,
+            [item_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((source, remote_id, source_url, content_type, local_dir, article_path, video_path, cover_path)) = value else {
+        return Ok(());
+    };
+
+    conn.execute(
+        r#"
+        INSERT INTO content_item_deletions (source, remote_id, source_url, content_type)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(source, remote_id) DO UPDATE SET
+          source_url = excluded.source_url,
+          content_type = excluded.content_type,
+          deleted_at = datetime('now','localtime')
+        "#,
+        params![&source, &remote_id, &source_url, &content_type],
+    )?;
+    conn.execute("DELETE FROM content_item_tags WHERE item_id = ?1", [item_id])?;
+    conn.execute("DELETE FROM content_item_tag_blocks WHERE item_id = ?1", [item_id])?;
+    conn.execute("DELETE FROM content_items WHERE id = ?1", [item_id])?;
+
+    let local_dir_path = local_dir
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty());
+    if let Some(path) = local_dir_path {
+        if path.starts_with(download_dir) && path != download_dir && path.exists() {
+            if let Err(error) = fs::remove_dir_all(&path) {
+                eprintln!("[delete_content_item] failed to remove directory {}: {}", path.display(), error);
+            }
+            return Ok(());
+        }
+    }
+
+    for file_path in [article_path, video_path, cover_path].into_iter().flatten() {
+        let path = PathBuf::from(file_path);
+        if path.exists() {
+            if let Err(error) = fs::remove_file(&path) {
+                eprintln!("[delete_content_item] failed to remove file {}: {}", path.display(), error);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_deleted_remote_item(
+    conn: &Connection,
+    source: &str,
+    remote_id: &str,
+    source_url: &str,
+    content_type: &str,
+) -> Result<bool, AppError> {
+    let mut ids = BTreeSet::new();
+    insert_known_remote_id_variants(&mut ids, remote_id, source_url, content_type);
+    for id in ids {
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM content_item_deletions WHERE source = ?1 AND remote_id = ?2 LIMIT 1",
+                params![source, id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if exists {
+            return Ok(true);
+        }
+    }
+
+    let normalized = normalized_remote_url(source_url).unwrap_or_else(|| source_url.to_string());
+    let exists = conn
+        .query_row(
+            r#"
+            SELECT 1
+            FROM content_item_deletions
+            WHERE source = ?1
+              AND (source_url = ?2 OR source_url = ?3)
+            LIMIT 1
+            "#,
+            params![source, source_url, normalized],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
 pub fn list_item_tags(conn: &Connection, item_id: i64) -> Result<Vec<String>, AppError> {
     let mut stmt = conn.prepare(
         r#"
@@ -1320,5 +1443,25 @@ pub fn list_known_remote_ids(conn: &Connection, source: &str) -> Result<Vec<Stri
         let (remote_id, source_url, content_type) = row?;
         insert_known_remote_id_variants(&mut remote_ids, &remote_id, &source_url, &content_type);
     }
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT remote_id, source_url, content_type
+        FROM content_item_deletions
+        WHERE source = ?1
+        "#,
+    )?;
+    let rows = stmt.query_map([source], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (remote_id, source_url, content_type) = row?;
+        insert_known_remote_id_variants(&mut remote_ids, &remote_id, &source_url, &content_type);
+    }
+
     Ok(remote_ids.into_iter().collect())
 }

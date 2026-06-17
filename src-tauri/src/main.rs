@@ -101,6 +101,7 @@ fn main() {
             commands::list_tags,
             commands::add_item_tag,
             commands::remove_item_tag,
+            commands::delete_content_item,
             commands::get_user_profile,
             commands::open_download_dir,
             commands::open_item_dir,

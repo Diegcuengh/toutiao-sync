@@ -140,6 +140,10 @@ export async function removeItemTag(itemId: number, tag: string): Promise<string
   return safeInvoke("remove_item_tag", { itemId, tag });
 }
 
+export async function deleteContentItem(itemId: number): Promise<void> {
+  return safeInvoke("delete_content_item", { itemId });
+}
+
 export async function openDownloadDir(): Promise<void> {
   return safeInvoke("open_download_dir");
 }
