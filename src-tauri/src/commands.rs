@@ -1,9 +1,9 @@
-﻿use std::{path::{Path, PathBuf}, process::Command, sync::Arc};
+﻿use std::{path::{Path, PathBuf}, process::Command};
 
 use chrono::Local;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
-use tauri::{LogicalPosition, LogicalSize, State, Webview, Wry};
+use tauri::State;
 use uuid::Uuid;
 
 use crate::{
@@ -16,6 +16,17 @@ use crate::{
 };
 
 fn log_command(name: &str) {
+    if matches!(
+        name,
+        "bootstrap_app"
+            | "list_sync_sessions"
+            | "list_sync_events"
+            | "search_items"
+            | "list_tags"
+            | "get_user_profile"
+    ) {
+        return;
+    }
     println!("{}", build_info::command_banner(name));
 }
 
