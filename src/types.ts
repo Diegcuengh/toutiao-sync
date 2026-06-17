@@ -1,5 +1,6 @@
 export type SyncSource = "favorites" | "likes";
 export type ContentTypeFilter = "all" | "article" | "video";
+export type DownloadStatusFilter = "downloaded" | "pending";
 
 export interface AppBootstrap {
   dbPath: string;

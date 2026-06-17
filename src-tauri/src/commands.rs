@@ -137,6 +137,7 @@ pub fn search_items(
     source: Option<String>,
     content_type: Option<String>,
     tag_filters: Option<Vec<String>>,
+    download_status: Option<String>,
     page: Option<i64>,
     page_size: Option<i64>,
 ) -> Result<PagedContentItems, AppError> {
@@ -148,6 +149,7 @@ pub fn search_items(
         source.as_deref(),
         content_type.as_deref(),
         tag_filters.as_deref().unwrap_or(&[]),
+        download_status.as_deref(),
         page.unwrap_or(1),
         page_size.unwrap_or(50),
     )

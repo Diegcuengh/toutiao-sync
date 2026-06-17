@@ -1222,9 +1222,6 @@ function filterDownloadCandidates(list, targetRemoteIds) {
     return [];
   }
   return list.filter((item) => {
-    if ((item.contentType || "").toLowerCase() === "video" || item.sourceUrl.includes("/video/")) {
-      return false;
-    }
     return Array.from(remoteIdentityCandidates(item)).some((id) => targetSet.has(id));
   });
 }
@@ -1285,10 +1282,126 @@ function normalizeText(text) {
   return (text || "").replace(/\s+/g, " ").trim();
 }
 
-async function collectDetail(page, job, item) {
-  if ((item.contentType || "").toLowerCase() === "video" || item.sourceUrl.includes("/video/")) {
-    throw new Error("跳过视频内容：当前下载模式只下载文章");
+function isVideoItem(item) {
+  return (item.contentType || "").toLowerCase() === "video" || String(item.sourceUrl || "").includes("/video/");
+}
+
+function normalizeCandidateVideoUrl(value) {
+  if (typeof value !== "string") {
+    return "";
   }
+  let candidate = value.trim();
+  if (!candidate) {
+    return "";
+  }
+  candidate = candidate
+    .replace(/\\u002F/gi, "/")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/g, "&");
+  if (/^https?%3A/i.test(candidate)) {
+    try {
+      candidate = decodeURIComponent(candidate);
+    } catch {
+      // keep the original value
+    }
+  }
+  return candidate;
+}
+
+function decodeBase64VideoUrl(value) {
+  if (typeof value !== "string" || value.length < 12) {
+    return "";
+  }
+  const compact = value.trim().replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/=_-]+$/.test(compact)) {
+    return "";
+  }
+  try {
+    const decoded = Buffer.from(compact.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    return /^https?:\/\//i.test(decoded) ? normalizeCandidateVideoUrl(decoded) : "";
+  } catch {
+    return "";
+  }
+}
+
+function isDirectVideoUrl(url) {
+  return /^https?:\/\//i.test(url) && /\.(mp4|m4v|mov|webm)(?:[?#]|$)/i.test(url);
+}
+
+function videoExtensionFromUrl(url) {
+  try {
+    const ext = path.extname(new URL(url).pathname).toLowerCase();
+    if ([".mp4", ".m4v", ".mov", ".webm"].includes(ext)) {
+      return ext;
+    }
+  } catch {
+    // fall back below
+  }
+  return ".mp4";
+}
+
+function coverExtensionFromUrl(url) {
+  try {
+    const ext = path.extname(new URL(url).pathname).toLowerCase();
+    if ([".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"].includes(ext)) {
+      return ext;
+    }
+    if ([".mp4", ".m4v", ".mov", ".webm", ".m3u8"].includes(ext)) {
+      return "";
+    }
+  } catch {
+    // fall back below
+  }
+  return ".jpg";
+}
+
+function isDownloadableCoverUrl(url) {
+  return /^https?:\/\//i.test(url || "") && Boolean(coverExtensionFromUrl(url));
+}
+
+function createVideoCandidateCollector(baseUrl) {
+  const seen = new Set();
+  const candidates = [];
+  const add = (rawUrl, source = "unknown", allowNonMp4 = false) => {
+    const values = [rawUrl, decodeBase64VideoUrl(rawUrl)];
+    for (const value of values) {
+      const normalized = normalizeCandidateVideoUrl(value);
+      if (!normalized || normalized.startsWith("blob:") || normalized.startsWith("data:")) {
+        continue;
+      }
+      const resolved = resolveAssetUrl(normalized, baseUrl);
+      if (!resolved || (!allowNonMp4 && !isDirectVideoUrl(resolved))) {
+        continue;
+      }
+      if (seen.has(resolved)) {
+        continue;
+      }
+      seen.add(resolved);
+      candidates.push({ url: resolved, source });
+    }
+  };
+  return { candidates, add };
+}
+
+async function downloadFirstVideo(candidates, itemDir) {
+  const failures = [];
+  for (const candidate of candidates) {
+    const videoPath = path.join(itemDir, `video${videoExtensionFromUrl(candidate.url)}`);
+    try {
+      await downloadToFile(candidate.url, videoPath);
+      const size = fs.statSync(videoPath).size;
+      if (size > 0) {
+        return { videoUrl: candidate.url, videoPath };
+      }
+      failures.push(`${candidate.source}: 空文件`);
+    } catch (error) {
+      failures.push(`${candidate.source}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  throw new Error(`未能下载可用视频文件；候选 ${candidates.length} 个。${failures.slice(0, 3).join("；")}`);
+}
+
+async function collectArticleDetail(page, job, item) {
   await page.goto(item.sourceUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
   await page.waitForTimeout(2500);
 
@@ -1385,6 +1498,192 @@ async function collectDetail(page, job, item) {
   };
 }
 
+async function collectVideoDetail(page, job, item) {
+  const itemDir = path.join(job.downloadDir, job.source, stableLocalId(item));
+  ensureDir(itemDir);
+
+  const collector = createVideoCandidateCollector(item.sourceUrl);
+  const responseHandler = (response) => {
+    const url = response.url();
+    const contentType = String(response.headers()?.["content-type"] || "").toLowerCase();
+    if (contentType.includes("video/")) {
+      collector.add(url, `response:${contentType}`, true);
+    } else if (isDirectVideoUrl(url)) {
+      collector.add(url, "response:url");
+    }
+  };
+
+  page.on("response", responseHandler);
+  try {
+    await page.goto(item.sourceUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
+    await page.waitForTimeout(2500);
+    await page.evaluate(() => {
+      const video = document.querySelector("video");
+      if (video) {
+        video.muted = true;
+        const played = video.play?.();
+        if (played?.catch) {
+          played.catch(() => {});
+        }
+      }
+      const playButton = document.querySelector(
+        ".xgplayer-start, .video-placeholder, .play-btn, [class*='play'], [aria-label*='播放']",
+      );
+      playButton?.click?.();
+    }).catch(() => {});
+    await page.waitForTimeout(3000);
+
+    const detail = await page.evaluate(() => {
+      const readText = (selector) => document.querySelector(selector)?.textContent?.trim() || "";
+      const normalizeCandidate = (value) => {
+        if (typeof value !== "string") {
+          return "";
+        }
+        return value.trim().replace(/\\u002F/gi, "/").replace(/\\\//g, "/").replace(/&amp;/g, "&");
+      };
+      const candidates = [];
+      const addCandidate = (value, source, allowNonMp4 = false) => {
+        const normalized = normalizeCandidate(value);
+        if (!normalized || normalized.startsWith("blob:") || normalized.startsWith("data:")) {
+          return;
+        }
+        candidates.push({ url: normalized, source, allowNonMp4 });
+      };
+      const scan = (value, keyPath = []) => {
+        if (typeof value === "string") {
+          const joinedPath = keyPath.join(".").toLowerCase();
+          const likelyVideoField = /(main_url|backup_url|play_addr|play_url|video_url|video_list|url_list|download_addr|bitrate)/.test(joinedPath);
+          if (likelyVideoField || /\.(mp4|m4v|mov|webm)(?:[?#]|$)/i.test(value)) {
+            addCandidate(value, joinedPath || "json", likelyVideoField);
+          }
+          return;
+        }
+        if (!value || typeof value !== "object") {
+          return;
+        }
+        if (Array.isArray(value)) {
+          value.forEach((item) => scan(item, keyPath));
+          return;
+        }
+        Object.entries(value).forEach(([key, nested]) => scan(nested, [...keyPath, key]));
+      };
+
+      const globals = [
+        window.__SSR_HYDRATED_DATA__,
+        window.__INITIAL_STATE__,
+        window.__NEXT_DATA__,
+        window.__UNIVERSAL_DATA__,
+        window._SSR_DATA,
+      ];
+      globals.forEach((value, index) => scan(value, [`global_${index}`]));
+
+      for (const script of Array.from(document.scripts)) {
+        const text = script.textContent || "";
+        const mp4Pattern = /https?:\\?\/\\?\/[^"'<>\\\s]+?\.(?:mp4|m4v|mov|webm)(?:[^"'<>\\\s]*)?/gi;
+        for (const match of text.matchAll(mp4Pattern)) {
+          addCandidate(match[0], "script:direct");
+        }
+        const fieldPattern = /"(main_url|backup_url|play_url|video_url)"\s*:\s*"([^"]+)"/gi;
+        for (const match of text.matchAll(fieldPattern)) {
+          addCandidate(match[2], `script:${match[1]}`, true);
+        }
+      }
+
+      const video = document.querySelector("video");
+      addCandidate(video?.currentSrc || video?.getAttribute?.("src") || "", "dom:video", true);
+      const posterVideo = document.querySelector("video[poster]");
+      const imageNode = document.querySelector("img");
+      const title =
+        document.querySelector("h1")?.textContent?.trim() ||
+        document.querySelector("[class*='title']")?.textContent?.trim() ||
+        document.title;
+      const contentText = document.querySelector(".main")?.textContent?.trim() || document.body.textContent?.trim() || "";
+      return {
+        title,
+        summary: contentText.slice(0, 500),
+        contentText,
+        author: readText("[class*='author']") || readText("a[href*='user']"),
+        coverUrl:
+          posterVideo?.getAttribute?.("poster") ||
+          imageNode?.currentSrc ||
+          imageNode?.getAttribute?.("src") ||
+          "",
+        pageUrl: location.href,
+        videoCandidates: candidates,
+      };
+    });
+
+    for (const candidate of detail.videoCandidates || []) {
+      collector.add(candidate.url, candidate.source || "dom", Boolean(candidate.allowNonMp4));
+    }
+
+    const { videoUrl, videoPath } = await downloadFirstVideo(collector.candidates, itemDir);
+    let coverPath = null;
+    const resolvedCoverUrl = resolveAssetUrl(detail.coverUrl || item.coverUrl, detail.pageUrl || item.sourceUrl);
+    if (isDownloadableCoverUrl(resolvedCoverUrl)) {
+      const coverExt = coverExtensionFromUrl(resolvedCoverUrl);
+      coverPath = path.join(itemDir, `cover${coverExt}`);
+      try {
+        await downloadToFile(resolvedCoverUrl, coverPath);
+      } catch {
+        coverPath = null;
+      }
+    }
+
+    const rawPath = path.join(itemDir, "video.json");
+    await writeTextFile(
+      rawPath,
+      JSON.stringify(
+        {
+          fetchedAt: new Date().toISOString(),
+          source: job.source,
+          sourceUrl: item.sourceUrl,
+          title: detail.title,
+          summary: detail.summary,
+          videoUrl,
+          coverUrl: resolvedCoverUrl,
+          coverPath,
+          videoPath,
+          pageUrl: detail.pageUrl,
+        },
+        null,
+        2,
+      ),
+    );
+
+    return {
+      remote_id: canonicalRemoteId(item),
+      title: item.title || detail.title,
+      summary: item.summary || textToSummary(detail.summary),
+      content_text: "",
+      author: item.author || detail.author,
+      content_type: "video",
+      source_url: item.sourceUrl,
+      cover_url: resolvedCoverUrl || null,
+      cover_path: coverPath,
+      article_path: null,
+      video_path: videoPath,
+      local_dir: itemDir,
+      downloaded: true,
+      raw: {
+        ...(item.raw && typeof item.raw === "object" ? item.raw : {}),
+        detail: {
+          title: detail.title,
+          author: detail.author,
+          coverUrl: resolvedCoverUrl,
+          videoUrl,
+        },
+      },
+    };
+  } finally {
+    page.off("response", responseHandler);
+  }
+}
+
+async function collectDetail(page, job, item) {
+  return isVideoItem(item) ? collectVideoDetail(page, job, item) : collectArticleDetail(page, job, item);
+}
+
 async function main() {
   const { jobPath, checkLogin } = parseArgs();
   const job = normalizeJobConfig(JSON.parse(fs.readFileSync(jobPath, "utf8")));
@@ -1417,7 +1716,7 @@ async function main() {
 
   if (isDownloadMode) {
     const downloadQueue = Array.isArray(job.downloadItems) ? job.downloadItems : [];
-    emitProgress(`待下载文章 ${downloadQueue.length} 条；已下载内容会自动跳过`, {
+    emitProgress(`待下载内容 ${downloadQueue.length} 条；已下载内容会自动跳过`, {
       candidates: downloadQueue.length,
       skipped: 0,
       discovered: downloadQueue.length,

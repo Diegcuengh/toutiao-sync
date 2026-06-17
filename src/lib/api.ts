@@ -1,5 +1,5 @@
 ﻿import { invoke } from "@tauri-apps/api/core";
-import type { AppBootstrap, ContentItem, DiagnosePageRequest, LoginStatus, PageDiagnosis, PagedContentItems, SyncEvent, SyncSession, SyncStartRequest, TagOption, UserProfile } from "../types";
+import type { AppBootstrap, ContentItem, DiagnosePageRequest, DownloadStatusFilter, LoginStatus, PageDiagnosis, PagedContentItems, SyncEvent, SyncSession, SyncStartRequest, TagOption, UserProfile } from "../types";
 
 function hasTauriRuntime() {
   if (typeof window === "undefined") {
@@ -88,13 +88,14 @@ export async function searchItemsWithType(
   source?: "favorites" | "likes",
   contentType?: "article" | "video",
   tagFilters?: string[],
+  downloadStatus?: DownloadStatusFilter,
   page = 1,
   pageSize = 50,
 ): Promise<PagedContentItems> {
   if (!hasTauriRuntime()) {
     return { items: [], total: 0, page, pageSize };
   }
-  return safeInvoke("search_items", { query, source, contentType, tagFilters, page, pageSize });
+  return safeInvoke("search_items", { query, source, contentType, tagFilters, downloadStatus, page, pageSize });
 }
 
 export async function getUserProfile(): Promise<UserProfile | null> {
@@ -110,6 +111,8 @@ export async function listTags(source?: "favorites" | "likes"): Promise<TagOptio
       { name: "所有", count: 0 },
       { name: "视频", count: 0 },
       { name: "文章", count: 0 },
+      { name: "已下载", count: 0 },
+      { name: "未下载", count: 0 },
       { name: "IT", count: 0 },
       { name: "编程", count: 0 },
       { name: "运动", count: 0 },

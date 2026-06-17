@@ -704,9 +704,11 @@ pub fn list_remote_ids_requiring_download(conn: &Connection, source: &str) -> Re
         SELECT remote_id
         FROM content_items
         WHERE source = ?1
-          AND content_type = 'article'
-          AND article_path IS NULL
-        ORDER BY synced_at DESC
+          AND (
+            (content_type = 'article' AND article_path IS NULL)
+            OR (content_type = 'video' AND video_path IS NULL)
+          )
+        ORDER BY synced_at DESC, CASE WHEN list_order IS NULL THEN 1 ELSE 0 END, list_order ASC
         "#,
     )?;
     let rows = stmt.query_map([source], |row| row.get::<_, String>(0))?;
@@ -723,8 +725,10 @@ pub fn list_items_requiring_download(conn: &Connection, source: &str) -> Result<
         SELECT remote_id, title, summary, author, content_type, source_url, cover_url, list_order, raw_json
         FROM content_items
         WHERE source = ?1
-          AND content_type = 'article'
-          AND article_path IS NULL
+          AND (
+            (content_type = 'article' AND article_path IS NULL)
+            OR (content_type = 'video' AND video_path IS NULL)
+          )
         ORDER BY synced_at DESC, CASE WHEN list_order IS NULL THEN 1 ELSE 0 END, list_order ASC
         "#,
     )?;
@@ -926,6 +930,7 @@ pub fn search_items_page(
     source: Option<&str>,
     content_type: Option<&str>,
     tag_filters: &[String],
+    download_status: Option<&str>,
     page: i64,
     page_size: i64,
 ) -> Result<PagedContentItems, AppError> {
@@ -954,6 +959,12 @@ pub fn search_items_page(
     if let Some(content_type_value) = content_type.filter(|value| !value.trim().is_empty()) {
         where_sql.push_str(" AND content_type = ?");
         binds.push(content_type_value.to_string());
+    }
+
+    match download_status.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("downloaded") => where_sql.push_str(" AND (article_path IS NOT NULL OR video_path IS NOT NULL)"),
+        Some("pending") => where_sql.push_str(" AND (article_path IS NULL AND video_path IS NULL)"),
+        _ => {}
     }
 
     let clean_tag_filters = tag_filters
@@ -1068,6 +1079,16 @@ pub fn list_tag_options(conn: &Connection, source: Option<&str>) -> Result<Vec<T
         let (source_sql, mut binds) = latest_source_filter_sql(source);
         let sql = format!("SELECT COUNT(*) FROM content_items WHERE 1 = 1 {source_sql} AND content_type = ?");
         binds.push(content_type.to_string());
+        let count = conn.query_row(&sql, rusqlite::params_from_iter(binds.iter()), |row| row.get::<_, i64>(0))?;
+        options.push(TagOption { name: name.to_string(), count });
+    }
+
+    for (name, condition) in [
+        ("已下载", "(article_path IS NOT NULL OR video_path IS NOT NULL)"),
+        ("未下载", "(article_path IS NULL AND video_path IS NULL)"),
+    ] {
+        let (source_sql, binds) = latest_source_filter_sql(source);
+        let sql = format!("SELECT COUNT(*) FROM content_items WHERE 1 = 1 {source_sql} AND {condition}");
         let count = conn.query_row(&sql, rusqlite::params_from_iter(binds.iter()), |row| row.get::<_, i64>(0))?;
         options.push(TagOption { name: name.to_string(), count });
     }

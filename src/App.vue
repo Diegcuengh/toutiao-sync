@@ -22,7 +22,7 @@ import {
   startSync,
   stopSync,
 } from "./lib/api";
-import type { AppBootstrap, ContentItem, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncSource, TagOption, UserProfile } from "./types";
+import type { AppBootstrap, ContentItem, DownloadStatusFilter, LoginStatus, PageDiagnosis, SyncEvent, SyncSession, SyncSource, TagOption, UserProfile } from "./types";
 
 const bootstrap = ref<AppBootstrap | null>(null);
 const sessions = ref<SyncSession[]>([]);
@@ -63,12 +63,20 @@ const canSync = computed(() => Boolean(loginStatus.value?.loggedIn) && !loginChe
 const pageCount = computed(() => Math.max(1, Math.ceil(totalItems.value / PAGE_SIZE)));
 const pageStart = computed(() => (totalItems.value ? (currentPage.value - 1) * PAGE_SIZE + 1 : 0));
 const pageEnd = computed(() => Math.min(currentPage.value * PAGE_SIZE, totalItems.value));
-const semanticTagFilters = computed(() => selectedTags.value.filter((tag) => !["所有", "视频", "文章"].includes(tag)));
+const systemTags = new Set(["所有", "视频", "文章", "已下载", "未下载"]);
+const semanticTagFilters = computed(() => selectedTags.value.filter((tag) => !systemTags.has(tag)));
 const contentTypeFilter = computed(() => {
   const wantsVideo = selectedTags.value.includes("视频");
   const wantsArticle = selectedTags.value.includes("文章");
   if (wantsVideo && !wantsArticle) return "video";
   if (wantsArticle && !wantsVideo) return "article";
+  return undefined;
+});
+const downloadStatusFilter = computed<DownloadStatusFilter | undefined>(() => {
+  const wantsDownloaded = selectedTags.value.includes("已下载");
+  const wantsPending = selectedTags.value.includes("未下载");
+  if (wantsDownloaded && !wantsPending) return "downloaded";
+  if (wantsPending && !wantsDownloaded) return "pending";
   return undefined;
 });
 const renderedItems = computed(() =>
@@ -224,6 +232,7 @@ async function loadItems() {
     source,
     contentTypeFilter.value,
     semanticTagFilters.value,
+    downloadStatusFilter.value,
     currentPage.value,
     PAGE_SIZE,
   );
@@ -433,6 +442,11 @@ function toggleTag(tag: string) {
   if (selected.has(tag)) {
     selected.delete(tag);
   } else {
+    if (tag === "已下载") {
+      selected.delete("未下载");
+    } else if (tag === "未下载") {
+      selected.delete("已下载");
+    }
     selected.add(tag);
   }
   selectedTags.value = Array.from(selected);
