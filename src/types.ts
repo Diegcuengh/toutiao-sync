@@ -1,11 +1,12 @@
 export type SyncSource = "favorites" | "likes";
 export type ContentTypeFilter = "all" | "article" | "video";
-export type DownloadStatusFilter = "downloaded" | "pending";
+export type DownloadStatusFilter = "downloaded" | "pending" | "failed";
 
 export interface AppBootstrap {
   dbPath: string;
   dataDir: string;
   downloadDir: string;
+  downloadThreads: number;
   activeSessionIds: string[];
   version: string;
   buildDate: string;
@@ -83,6 +84,7 @@ export interface ContentItem {
   listOrder?: number | null;
   syncedAt: string;
   downloaded: boolean;
+  downloadError?: string | null;
   rawJson: string;
   tags: string[];
 }

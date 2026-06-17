@@ -1,6 +1,6 @@
 ﻿use std::{
     fs,
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -24,6 +24,7 @@ struct ScriptJob<'a> {
     download_dir: String,
     chrome_user_data_dir: String,
     cdp_port: u16,
+    download_threads: usize,
     known_remote_ids: Vec<String>,
     download_items: Vec<serde_json::Value>,
 }
@@ -34,6 +35,7 @@ pub fn spawn_sync(state: AppState, session: SyncSession) -> Result<(), AppError>
     let data_dir = state.data_dir()?;
     let download_dir = state.download_dir()?;
     let chrome_user_data_dir = state.chrome_user_data_dir()?;
+    let download_threads = state.download_threads()?;
 
     let job_path = jobs_dir.join(format!("{}.json", session.id));
     AppState::ensure_parent(&job_path)?;
@@ -57,6 +59,7 @@ pub fn spawn_sync(state: AppState, session: SyncSession) -> Result<(), AppError>
         download_dir: download_dir.display().to_string(),
         chrome_user_data_dir: chrome_user_data_dir.display().to_string(),
         cdp_port: state.chrome_cdp_port,
+        download_threads,
         known_remote_ids,
         download_items,
     };
@@ -100,6 +103,7 @@ pub fn diagnose_page(state: &AppState, source: &str) -> Result<PageDiagnosis, Ap
     let data_dir = state.data_dir()?;
     let download_dir = state.download_dir()?;
     let chrome_user_data_dir = state.chrome_user_data_dir()?;
+    let download_threads = state.download_threads()?;
 
     let job_path = jobs_dir.join(format!("diagnose-{}.json", source));
     AppState::ensure_parent(&job_path)?;
@@ -112,6 +116,7 @@ pub fn diagnose_page(state: &AppState, source: &str) -> Result<PageDiagnosis, Ap
         download_dir: download_dir.display().to_string(),
         chrome_user_data_dir: chrome_user_data_dir.display().to_string(),
         cdp_port: state.chrome_cdp_port,
+        download_threads,
         known_remote_ids: Vec::new(),
         download_items: Vec::new(),
     };
@@ -127,6 +132,7 @@ pub fn check_login_status(state: &AppState, source: &str) -> Result<LoginStatus,
     let data_dir = state.data_dir()?;
     let download_dir = state.download_dir()?;
     let chrome_user_data_dir = state.chrome_user_data_dir()?;
+    let download_threads = state.download_threads()?;
 
     let job_path = jobs_dir.join(format!("login-status-{}.json", source));
     AppState::ensure_parent(&job_path)?;
@@ -139,6 +145,7 @@ pub fn check_login_status(state: &AppState, source: &str) -> Result<LoginStatus,
         download_dir: download_dir.display().to_string(),
         chrome_user_data_dir: chrome_user_data_dir.display().to_string(),
         cdp_port: state.chrome_cdp_port,
+        download_threads,
         known_remote_ids: Vec::new(),
         download_items: Vec::new(),
     };
@@ -181,6 +188,7 @@ fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> Result<
     let mut discovered = 0_i64;
     let mut saved = 0_i64;
     let mut downloaded = 0_i64;
+    let mut inline_progress_active = false;
 
     for line_result in reader.lines() {
         let line = line_result?;
@@ -207,6 +215,7 @@ fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> Result<
                 discovered: discovered_value,
                 saved: saved_value,
                 downloaded: downloaded_value,
+                transient,
                 ..
             } => {
                 if let Some(value) = candidates_value {
@@ -224,7 +233,18 @@ fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> Result<
                 if let Some(value) = downloaded_value {
                     downloaded = value;
                 }
-                println!("[sync] {}", message);
+                let is_transient = transient.unwrap_or(false);
+                if is_transient {
+                    print!("\r[sync] {}\x1b[K", message);
+                    let _ = io::stdout().flush();
+                    inline_progress_active = true;
+                } else {
+                    if inline_progress_active {
+                        println!();
+                        inline_progress_active = false;
+                    }
+                    println!("[sync] {}", message);
+                }
                 db::update_session_progress(
                     &conn,
                     &session.id,
@@ -237,9 +257,15 @@ fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> Result<
                     &message,
                     None,
                 )?;
-                db::insert_sync_event(&conn, &session.id, "info", &message)?;
+                if !is_transient {
+                    db::insert_sync_event(&conn, &session.id, "info", &message)?;
+                }
             }
             ScriptEvent::Item { item } => {
+                if inline_progress_active {
+                    println!();
+                    inline_progress_active = false;
+                }
                 let synced_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 //println!("[item] {} {}", item.title, item.source_url);
                 db::upsert_item(&conn, &session.source, &item, &synced_at)?;
@@ -263,12 +289,22 @@ fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> Result<
                 db::insert_sync_event(&conn, &session.id, "info", &message)?;
             }
             ScriptEvent::Profile { profile } => {
+                if inline_progress_active {
+                    println!();
+                    inline_progress_active = false;
+                }
                 println!("[profile] {}", profile.name);
                 db::upsert_user_profile(&conn, &profile)?;
                 db::insert_sync_event(&conn, &session.id, "info", "已更新用户资料")?;
             }
             ScriptEvent::ItemError { source_url, message } => {
+                if inline_progress_active {
+                    println!();
+                    inline_progress_active = false;
+                }
                 let full_message = format!("抓取失败: {} ({})", message, source_url);
+                println!("[sync] {}", full_message);
+                db::mark_item_download_failed(&conn, &session.source, &source_url, &message)?;
                 db::update_session_progress(
                     &conn,
                     &session.id,
@@ -284,6 +320,10 @@ fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> Result<
                 db::insert_sync_event(&conn, &session.id, "error", &full_message)?;
             }
             ScriptEvent::Done { summary } => {
+                if inline_progress_active {
+                    println!();
+                    inline_progress_active = false;
+                }
                 candidates = summary.candidates;
                 skipped = summary.skipped;
                 discovered = summary.discovered;
@@ -309,6 +349,9 @@ fn run_sync(state: AppState, session: SyncSession, job_path: PathBuf) -> Result<
                 db::insert_sync_event(&conn, &session.id, "info", &completion_message)?;
             }
             ScriptEvent::Error { message, .. } => {
+                if inline_progress_active {
+                    println!();
+                }
                 let finished_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 db::update_session_progress(
                     &conn,

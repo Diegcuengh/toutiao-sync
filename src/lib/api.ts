@@ -25,6 +25,7 @@ export async function bootstrapApp(): Promise<AppBootstrap> {
       dbPath: "预览模式不可用",
       dataDir: "预览模式不可用",
       downloadDir: "预览模式不可用",
+      downloadThreads: 2,
       activeSessionIds: [],
       version: "preview",
       buildDate: "",
@@ -42,6 +43,10 @@ export async function chooseDataDirectory(): Promise<AppBootstrap | null> {
 
 export async function migrateDataDirectory(): Promise<AppBootstrap | null> {
   return safeInvoke("migrate_data_directory");
+}
+
+export async function setDownloadThreads(value: number): Promise<AppBootstrap> {
+  return safeInvoke("set_download_threads", { value });
 }
 
 export async function startSync(request: SyncStartRequest): Promise<SyncSession> {

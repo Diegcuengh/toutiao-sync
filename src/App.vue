@@ -19,6 +19,7 @@ import {
   openItemFile,
   removeItemTag,
   searchItemsWithType,
+  setDownloadThreads,
   startSync,
   stopSync,
 } from "./lib/api";
@@ -45,6 +46,7 @@ const selectedSessionId = ref<string>("");
 const diagnosis = ref<PageDiagnosis | null>(null);
 const loginStatus = ref<LoginStatus | null>(null);
 const settingsOpen = ref(false);
+const downloadThreads = ref(2);
 const error = ref("");
 let timer: number | undefined;
 let searchTimer: number | undefined;
@@ -63,7 +65,7 @@ const canSync = computed(() => Boolean(loginStatus.value?.loggedIn) && !loginChe
 const pageCount = computed(() => Math.max(1, Math.ceil(totalItems.value / PAGE_SIZE)));
 const pageStart = computed(() => (totalItems.value ? (currentPage.value - 1) * PAGE_SIZE + 1 : 0));
 const pageEnd = computed(() => Math.min(currentPage.value * PAGE_SIZE, totalItems.value));
-const systemTags = new Set(["所有", "视频", "文章", "已下载", "未下载"]);
+const systemTags = new Set(["所有", "视频", "文章", "已下载", "未下载", "下载失败"]);
 const semanticTagFilters = computed(() => selectedTags.value.filter((tag) => !systemTags.has(tag)));
 const contentTypeFilter = computed(() => {
   const wantsVideo = selectedTags.value.includes("视频");
@@ -75,8 +77,10 @@ const contentTypeFilter = computed(() => {
 const downloadStatusFilter = computed<DownloadStatusFilter | undefined>(() => {
   const wantsDownloaded = selectedTags.value.includes("已下载");
   const wantsPending = selectedTags.value.includes("未下载");
-  if (wantsDownloaded && !wantsPending) return "downloaded";
-  if (wantsPending && !wantsDownloaded) return "pending";
+  const wantsFailed = selectedTags.value.includes("下载失败");
+  if (wantsDownloaded && !wantsPending && !wantsFailed) return "downloaded";
+  if (wantsPending && !wantsDownloaded && !wantsFailed) return "pending";
+  if (wantsFailed && !wantsDownloaded && !wantsPending) return "failed";
   return undefined;
 });
 const renderedItems = computed(() =>
@@ -134,8 +138,18 @@ function getOriginalLine(item: ContentItem) {
   return text.replace(item.title, "").trim().slice(0, 80);
 }
 
+function getDownloadStatusText(item: ContentItem) {
+  if (item.downloaded) {
+    return "已下载";
+  }
+  if (item.downloadError) {
+    return "下载失败";
+  }
+  return "未下载";
+}
+
 function getOriginalCardHtml(item: ContentItem) {
-  const cacheKey = `${item.id}:${item.syncedAt}:${item.rawJson.length}`;
+  const cacheKey = `${item.id}:${item.syncedAt}:${item.downloaded ? 1 : 0}:${item.downloadError || ""}:${item.rawJson.length}`;
   const cached = originalHtmlCache.get(cacheKey);
   if (cached !== undefined) {
     return cached;
@@ -194,17 +208,12 @@ function getOriginalCardHtml(item: ContentItem) {
   if (footerTarget) {
     const localMeta = doc.createElement("span");
     localMeta.className = "local-sync-meta";
-    [
-      item.downloaded ? "已下载" : "未下载",
-      item.contentType === "video" ? "视频" : "文章",
-      item.listOrder ? `序号 ${item.listOrder}` : "",
-    ]
-      .filter(Boolean)
-      .forEach((value) => {
-      const metaItem = doc.createElement("span");
-      metaItem.textContent = value;
-      localMeta.appendChild(metaItem);
-    });
+    const metaItem = doc.createElement("span");
+    metaItem.textContent = getDownloadStatusText(item);
+    if (item.downloadError) {
+      metaItem.setAttribute("title", item.downloadError);
+    }
+    localMeta.appendChild(metaItem);
     footerTarget.appendChild(localMeta);
   }
   const normalizedHtml = doc.body.innerHTML;
@@ -269,6 +278,7 @@ async function loadAll(options?: { includeItems?: boolean; includeEvents?: boole
   error.value = "";
   try {
     bootstrap.value = await bootstrapApp();
+    downloadThreads.value = bootstrap.value.downloadThreads || 2;
     document.title = bootstrap.value.appTitle;
     sessions.value = await listSessions();
     if (!selectedSessionId.value && sessions.value[0]) {
@@ -400,6 +410,7 @@ async function handleChooseDataDirectory() {
     const result = await chooseDataDirectory();
     if (result) {
       bootstrap.value = result;
+      downloadThreads.value = result.downloadThreads || 2;
       await loadAll();
     }
   } catch (err) {
@@ -413,6 +424,7 @@ async function handleMigrateDataDirectory() {
     const result = await migrateDataDirectory();
     if (result) {
       bootstrap.value = result;
+      downloadThreads.value = result.downloadThreads || 2;
       await loadAll();
     }
   } catch (err) {
@@ -426,6 +438,18 @@ async function handleSearch() {
     activeTab.value = "local";
     await loadTagOptions();
     await loadItems();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  }
+}
+
+async function handleSetDownloadThreads() {
+  const nextValue = Math.min(Math.max(1, Math.trunc(Number(downloadThreads.value) || 2)), 8);
+  downloadThreads.value = nextValue;
+  error.value = "";
+  try {
+    bootstrap.value = await setDownloadThreads(nextValue);
+    downloadThreads.value = bootstrap.value.downloadThreads || nextValue;
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   }
@@ -618,7 +642,21 @@ onBeforeUnmount(() => {
         <span>数据库：{{ bootstrap.dbPath }}</span>
         <span>数据目录：{{ bootstrap.dataDir }}</span>
         <span>下载目录：{{ bootstrap.downloadDir }}</span>
+        <span>下载线程：{{ bootstrap.downloadThreads }}</span>
       </div>
+      <label class="settings-field">
+        <span>下载线程数量</span>
+        <input
+          v-model.number="downloadThreads"
+          type="number"
+          min="1"
+          max="8"
+          step="1"
+          :disabled="syncing"
+          @change="handleSetDownloadThreads"
+        />
+        <small>1-8，默认 2；只影响“下载内容”。</small>
+      </label>
       <div class="settings-actions">
         <button class="secondary" :disabled="syncing" @click="handleChooseDataDirectory">选择数据目录</button>
         <button class="secondary" :disabled="syncing" @click="handleMigrateDataDirectory">迁移数据目录</button>
@@ -814,14 +852,10 @@ onBeforeUnmount(() => {
                 <img :src="entry.listImage" alt="" />
                 <span v-if="entry.item.contentType === 'video'" class="video-mark">▶</span>
               </div>
-              <div
-                v-if="!entry.originalHtml || entry.item.articlePath || entry.item.videoPath || entry.item.localDir"
-                class="toutiao-meta"
-              >
-                <span>{{ entry.item.downloaded ? "已下载" : "未下载" }}</span>
-                <span v-if="entry.item.author">{{ entry.item.author }}</span>
-                <span>{{ entry.item.contentType === "video" ? "视频" : "文章" }}</span>
-                <span v-if="entry.item.listOrder">序号 {{ entry.item.listOrder }}</span>
+              <div class="toutiao-meta">
+                <span v-if="!entry.originalHtml" :title="entry.item.downloadError || ''">
+                  {{ getDownloadStatusText(entry.item) }}
+                </span>
                 <button
                   v-if="entry.item.articlePath"
                   class="link-button"
@@ -836,7 +870,7 @@ onBeforeUnmount(() => {
                 >
                   打开视频
                 </button>
-                <button v-if="entry.item.localDir" class="link-button" @click="openItemDir(entry.item.id)">本地目录</button>
+                <button class="link-button" @click="openItemDir(entry.item.id)">打开文件夹</button>
               </div>
               <div class="item-tags">
                 <button

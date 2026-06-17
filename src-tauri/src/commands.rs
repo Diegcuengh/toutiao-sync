@@ -56,6 +56,7 @@ fn make_bootstrap(state: &AppState) -> Result<AppBootstrap, AppError> {
         db_path: paths.db_path.display().to_string(),
         data_dir: paths.data_dir.display().to_string(),
         download_dir: paths.download_dir.display().to_string(),
+        download_threads: state.download_threads()?,
         active_session_ids: state.active_session_ids(),
         version: build_info::VERSION.to_string(),
         build_date: build_info::BUILD_DATE.to_string(),
@@ -122,6 +123,13 @@ pub fn migrate_data_directory(state: State<'_, AppState>) -> Result<Option<AppBo
     };
     state.set_data_root(path, true)?;
     Ok(Some(make_bootstrap(state.inner())?))
+}
+
+#[tauri::command]
+pub fn set_download_threads(state: State<'_, AppState>, value: usize) -> Result<AppBootstrap, AppError> {
+    log_command("set_download_threads");
+    state.set_download_threads(value)?;
+    make_bootstrap(state.inner())
 }
 
 #[tauri::command]
@@ -332,7 +340,7 @@ pub fn open_download_dir(state: State<'_, AppState>) -> Result<(), AppError> {
 pub fn open_item_dir(state: State<'_, AppState>, item_id: i64) -> Result<(), AppError> {
     log_command("open_item_dir");
     let conn = db::connect(&state.db_path()?)?;
-    let Some(local_dir) = db::get_item_dir(&conn, item_id)? else {
+    let Some(local_dir) = db::get_or_create_item_dir(&conn, item_id, &state.download_dir()?)? else {
         return Err(AppError::Message("该内容没有本地目录".into()));
     };
     Command::new("explorer").arg(local_dir).spawn()?;

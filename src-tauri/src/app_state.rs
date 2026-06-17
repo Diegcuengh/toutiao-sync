@@ -24,6 +24,8 @@ pub struct AppPaths {
 #[derive(Debug, Serialize, Deserialize)]
 struct AppConfig {
     data_root: String,
+    #[serde(default = "default_download_threads")]
+    download_threads: usize,
 }
 
 #[derive(Default)]
@@ -107,6 +109,11 @@ impl AppState {
         Ok(self.current_paths()?.download_dir)
     }
 
+    pub fn download_threads(&self) -> Result<usize, AppError> {
+        let config = load_config(&self.config_path)?;
+        Ok(normalize_download_threads(config.download_threads))
+    }
+
     pub fn jobs_dir(&self) -> Result<PathBuf, AppError> {
         Ok(self.current_paths()?.jobs_dir)
     }
@@ -179,7 +186,8 @@ impl AppState {
 
         let conn = db::connect(&new_paths.db_path)?;
         drop(conn);
-        save_config(&self.config_path, &new_paths.data_dir)?;
+        let current_config = load_config(&self.config_path)?;
+        save_config(&self.config_path, &new_paths.data_dir, normalize_download_threads(current_config.download_threads))?;
 
         let mut guard = self
             .paths
@@ -195,6 +203,21 @@ impl AppState {
         }
         Ok(())
     }
+
+    pub fn set_download_threads(&self, value: usize) -> Result<usize, AppError> {
+        let download_threads = normalize_download_threads(value);
+        let paths = self.current_paths()?;
+        save_config(&self.config_path, &paths.data_dir, download_threads)?;
+        Ok(download_threads)
+    }
+}
+
+fn default_download_threads() -> usize {
+    2
+}
+
+fn normalize_download_threads(value: usize) -> usize {
+    value.clamp(1, 8)
 }
 
 fn default_data_root() -> PathBuf {
@@ -228,21 +251,35 @@ fn ensure_data_dirs(paths: &AppPaths) -> Result<(), AppError> {
     Ok(())
 }
 
+fn load_config(config_path: &Path) -> Result<AppConfig, AppError> {
+    if !config_path.exists() {
+        return Ok(AppConfig {
+            data_root: default_data_root().display().to_string(),
+            download_threads: default_download_threads(),
+        });
+    }
+    let content = fs::read_to_string(config_path)?;
+    let config: AppConfig = serde_json::from_str(&content)?;
+    Ok(AppConfig {
+        data_root: config.data_root,
+        download_threads: normalize_download_threads(config.download_threads),
+    })
+}
+
 fn load_configured_root(config_path: &Path) -> Result<Option<PathBuf>, AppError> {
     if !config_path.exists() {
         return Ok(None);
     }
-    let content = fs::read_to_string(config_path)?;
-    let config: AppConfig = serde_json::from_str(&content)?;
-    Ok(Some(PathBuf::from(config.data_root)))
+    Ok(Some(PathBuf::from(load_config(config_path)?.data_root)))
 }
 
-fn save_config(config_path: &Path, data_root: &Path) -> Result<(), AppError> {
+fn save_config(config_path: &Path, data_root: &Path, download_threads: usize) -> Result<(), AppError> {
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent)?;
     }
     let config = AppConfig {
         data_root: data_root.display().to_string(),
+        download_threads: normalize_download_threads(download_threads),
     };
     fs::write(config_path, serde_json::to_vec_pretty(&config)?)?;
     Ok(())

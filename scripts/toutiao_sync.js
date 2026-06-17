@@ -71,6 +71,7 @@ function normalizeJobConfig(rawJob) {
   const cdpPort = rawJob.cdpPort || rawJob.cdp_port || 9222;
   const chromeUserDataDir = rawJob.chromeUserDataDir || rawJob.chrome_user_data_dir;
   const maxItems = Number(rawJob.maxItems || rawJob.max_items || 0) || 0;
+  const downloadThreads = Math.min(Math.max(1, Number(rawJob.downloadThreads || rawJob.download_threads || 2) || 2), 8);
 
   if (!dataDir) {
     throw new Error("任务缺少 dataDir/data_dir");
@@ -88,6 +89,7 @@ function normalizeJobConfig(rawJob) {
     cdpPort,
     chromeUserDataDir,
     maxItems,
+    downloadThreads,
   };
 }
 
@@ -134,8 +136,56 @@ function hashText(input) {
   return crypto.createHash("sha1").update(input).digest("hex");
 }
 
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) {
+    return `${value} B`;
+  }
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = value / 1024;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${size >= 10 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function formatSizeProgress(downloadedBytes, totalBytes) {
+  const downloadedText = formatBytes(downloadedBytes);
+  if (!totalBytes) {
+    return `已下载 ${downloadedText}`;
+  }
+  const percent = Math.min(100, (downloadedBytes / totalBytes) * 100);
+  return `已下载 ${downloadedText} / ${formatBytes(totalBytes)}（${percent.toFixed(1)}%）`;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function closePageQuietly(page, timeoutMs = 5000) {
+  if (!page) {
+    return;
+  }
+  await Promise.race([
+    page.close().catch(() => {}),
+    sleep(timeoutMs),
+  ]);
 }
 
 function probeChromeDebugger() {
@@ -1254,23 +1304,54 @@ function listItemToScriptItem(job, item) {
   };
 }
 
-async function downloadToFile(url, filePath) {
-  const response = await retryFileOperation(
-    () =>
-      axios.get(url, {
-        responseType: "arraybuffer",
-        timeout: 120000,
-        headers: {
-          Referer: "https://www.toutiao.com/",
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36",
-        },
-      }),
-    3,
-    800,
-  );
+async function downloadToFile(url, filePath, progress = null) {
+  const tempPath = `${filePath}.part`;
+  const response = await axios.get(url, {
+    responseType: "stream",
+    timeout: 120000,
+    headers: {
+      Referer: "https://www.toutiao.com/",
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36",
+    },
+  });
+  const totalBytes = Number(response.headers?.["content-length"] || 0) || 0;
+  let downloadedBytes = 0;
+  let lastEmitAt = 0;
+  let lastPercent = -1;
+  const emitSizeProgress = (force = false) => {
+    if (!progress) {
+      return;
+    }
+    const now = Date.now();
+    const percent = totalBytes ? Math.floor((downloadedBytes / totalBytes) * 100) : -1;
+    if (!force && now - lastEmitAt < 1000 && percent === lastPercent) {
+      return;
+    }
+    lastEmitAt = now;
+    lastPercent = percent;
+    emitProgress(`${progress.label}: ${progress.title}，${formatSizeProgress(downloadedBytes, totalBytes)}`, {
+      pageUrl: progress.sourceUrl,
+      pageTitle: progress.title,
+      transient: true,
+    });
+  };
+
   await retryFileOperation(async () => {
-    fs.writeFileSync(filePath, Buffer.from(response.data));
+    await fs.promises.rm(tempPath, { force: true }).catch(() => {});
+    await new Promise((resolve, reject) => {
+      const writer = fs.createWriteStream(tempPath);
+      response.data.on("data", (chunk) => {
+        downloadedBytes += chunk.length;
+        emitSizeProgress(false);
+      });
+      response.data.on("error", reject);
+      writer.on("error", reject);
+      writer.on("finish", resolve);
+      response.data.pipe(writer);
+    });
+    emitSizeProgress(true);
+    await fs.promises.rename(tempPath, filePath);
   });
 }
 
@@ -1383,12 +1464,12 @@ function createVideoCandidateCollector(baseUrl) {
   return { candidates, add };
 }
 
-async function downloadFirstVideo(candidates, itemDir) {
+async function downloadFirstVideo(candidates, itemDir, progress = null) {
   const failures = [];
   for (const candidate of candidates) {
     const videoPath = path.join(itemDir, `video${videoExtensionFromUrl(candidate.url)}`);
     try {
-      await downloadToFile(candidate.url, videoPath);
+      await downloadToFile(candidate.url, videoPath, progress);
       const size = fs.statSync(videoPath).size;
       if (size > 0) {
         return { videoUrl: candidate.url, videoPath };
@@ -1498,7 +1579,7 @@ async function collectArticleDetail(page, job, item) {
   };
 }
 
-async function collectVideoDetail(page, job, item) {
+async function collectVideoDetail(page, job, item, progress = null) {
   const itemDir = path.join(job.downloadDir, job.source, stableLocalId(item));
   ensureDir(itemDir);
 
@@ -1617,7 +1698,7 @@ async function collectVideoDetail(page, job, item) {
       collector.add(candidate.url, candidate.source || "dom", Boolean(candidate.allowNonMp4));
     }
 
-    const { videoUrl, videoPath } = await downloadFirstVideo(collector.candidates, itemDir);
+    const { videoUrl, videoPath } = await downloadFirstVideo(collector.candidates, itemDir, progress);
     let coverPath = null;
     const resolvedCoverUrl = resolveAssetUrl(detail.coverUrl || item.coverUrl, detail.pageUrl || item.sourceUrl);
     if (isDownloadableCoverUrl(resolvedCoverUrl)) {
@@ -1680,8 +1761,89 @@ async function collectVideoDetail(page, job, item) {
   }
 }
 
-async function collectDetail(page, job, item) {
-  return isVideoItem(item) ? collectVideoDetail(page, job, item) : collectArticleDetail(page, job, item);
+async function collectDetail(page, job, item, progress = null) {
+  return isVideoItem(item) ? collectVideoDetail(page, job, item, progress) : collectArticleDetail(page, job, item);
+}
+
+async function downloadQueueWithConcurrency(browser, job, downloadQueue) {
+  let saved = 0;
+  let downloaded = 0;
+  let nextIndex = 0;
+  let completed = 0;
+  const workerCount = Math.min(Math.max(1, Number(job.downloadThreads) || 1), downloadQueue.length);
+  const context = browser.contexts()[0] ?? (await browser.newContext());
+
+  async function worker(workerIndex) {
+    while (nextIndex < downloadQueue.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const item = downloadQueue[index];
+      const progressLabel = `视频下载中 ${index + 1}/${downloadQueue.length}（线程 ${workerIndex + 1}/${workerCount}）`;
+      emitProgress(`开始下载 ${index + 1}/${downloadQueue.length}（线程 ${workerIndex + 1}/${workerCount}）: ${item.title}`, {
+        candidates: downloadQueue.length,
+        skipped: 0,
+        discovered: downloadQueue.length,
+        processed: completed,
+        saved,
+        downloaded,
+        pageUrl: item.sourceUrl,
+        pageTitle: item.title,
+      });
+      let detailPage = null;
+      try {
+        detailPage = await context.newPage();
+        const detailPromise = collectDetail(detailPage, job, item, {
+          label: progressLabel,
+          title: item.title,
+          sourceUrl: item.sourceUrl,
+        });
+        detailPromise.catch(() => {});
+        const detail = await withTimeout(
+          detailPromise,
+          15 * 60 * 1000,
+          `单条下载超时，已跳过：${item.title}`,
+        );
+        if (detail.downloaded) {
+          downloaded += 1;
+        }
+        saved += 1;
+        completed += 1;
+        emit({ type: "item", item: detail });
+        emitProgress(`已下载并入库 ${saved}/${downloadQueue.length}: ${detail.title}`, {
+          candidates: downloadQueue.length,
+          skipped: 0,
+          discovered: downloadQueue.length,
+          processed: completed,
+          saved,
+          downloaded,
+          pageUrl: detail.source_url,
+          pageTitle: detail.title,
+        });
+      } catch (error) {
+        completed += 1;
+        emit({
+          type: "item_error",
+          sourceUrl: item.sourceUrl,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        emitProgress(`下载失败，继续下一条 ${index + 1}/${downloadQueue.length}: ${item.title}`, {
+          candidates: downloadQueue.length,
+          skipped: 0,
+          discovered: downloadQueue.length,
+          processed: completed,
+          saved,
+          downloaded,
+          pageUrl: item.sourceUrl,
+          pageTitle: item.title,
+        });
+      } finally {
+        await closePageQuietly(detailPage);
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, (_, index) => worker(index)));
+  return { saved, downloaded };
 }
 
 async function main() {
@@ -1716,7 +1878,7 @@ async function main() {
 
   if (isDownloadMode) {
     const downloadQueue = Array.isArray(job.downloadItems) ? job.downloadItems : [];
-    emitProgress(`待下载内容 ${downloadQueue.length} 条；已下载内容会自动跳过`, {
+    emitProgress(`待下载内容 ${downloadQueue.length} 条；已下载内容会自动跳过；下载线程 ${job.downloadThreads}`, {
       candidates: downloadQueue.length,
       skipped: 0,
       discovered: downloadQueue.length,
@@ -1729,51 +1891,7 @@ async function main() {
       return;
     }
 
-    let saved = 0;
-    let downloaded = 0;
-    const detailContext = browser.contexts()[0] ?? (await browser.newContext());
-    const detailPage = await detailContext.newPage();
-    try {
-      for (let index = 0; index < downloadQueue.length; index += 1) {
-        const item = downloadQueue[index];
-        emitProgress(`下载内容 ${index + 1}/${downloadQueue.length}: ${item.title}`, {
-          candidates: downloadQueue.length,
-          skipped: 0,
-          discovered: downloadQueue.length,
-          processed: index + 1,
-          saved,
-          downloaded,
-          pageUrl: item.sourceUrl,
-          pageTitle: item.title,
-        });
-        try {
-          const detail = await collectDetail(detailPage, job, item);
-          if (detail.downloaded) {
-            downloaded += 1;
-          }
-          saved += 1;
-          emit({ type: "item", item: detail });
-          emitProgress(`已下载并入库 ${saved}/${downloadQueue.length}: ${detail.title}`, {
-            candidates: downloadQueue.length,
-            skipped: 0,
-            discovered: downloadQueue.length,
-            processed: index + 1,
-            saved,
-            downloaded,
-            pageUrl: detail.source_url,
-            pageTitle: detail.title,
-          });
-        } catch (error) {
-          emit({
-            type: "item_error",
-            sourceUrl: item.sourceUrl,
-            message: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-    } finally {
-      await detailPage.close().catch(() => {});
-    }
+    const { saved, downloaded } = await downloadQueueWithConcurrency(browser, job, downloadQueue);
     emit({ type: "done", summary: { candidates: downloadQueue.length, skipped: 0, discovered: downloadQueue.length, saved, downloaded } });
     await browser.close();
     return;
@@ -1941,12 +2059,39 @@ async function main() {
   let saved = 0;
   let downloaded = 0;
   const detailContext = browser.contexts()[0] ?? (await browser.newContext());
-  const detailPage = await detailContext.newPage();
 
-  try {
-    for (let index = 0; index < selectedCandidates.length; index += 1) {
-      const item = selectedCandidates[index];
-      emitProgress(`${isDownloadMode ? "下载内容" : "抓取"} ${index + 1}/${selectedCandidates.length}: ${item.title}`, {
+  for (let index = 0; index < selectedCandidates.length; index += 1) {
+    const item = selectedCandidates[index];
+    emitProgress(`${isDownloadMode ? "下载内容" : "抓取"} ${index + 1}/${selectedCandidates.length}: ${item.title}`, {
+      candidates: list.length,
+      skipped,
+      discovered: selectedCandidates.length,
+      processed: index + 1,
+      saved,
+      downloaded,
+    });
+    let detailPage = null;
+    try {
+      detailPage = await detailContext.newPage();
+      const detailPromise = collectDetail(detailPage, job, item);
+      detailPromise.catch(() => {});
+      const detail = await withTimeout(
+        detailPromise,
+        15 * 60 * 1000,
+        `单条抓取超时，已跳过：${item.title}`,
+      );
+      if (detail.downloaded) {
+        downloaded += 1;
+      }
+      saved += 1;
+      emit({ type: "item", item: detail });
+    } catch (error) {
+      emit({
+        type: "item_error",
+        sourceUrl: item.sourceUrl,
+        message: error instanceof Error ? error.message : String(error),
+      });
+      emitProgress(`抓取失败，继续下一条 ${index + 1}/${selectedCandidates.length}: ${item.title}`, {
         candidates: list.length,
         skipped,
         discovered: selectedCandidates.length,
@@ -1954,23 +2099,9 @@ async function main() {
         saved,
         downloaded,
       });
-      try {
-        const detail = await collectDetail(detailPage, job, item);
-        if (detail.downloaded) {
-          downloaded += 1;
-        }
-        saved += 1;
-        emit({ type: "item", item: detail });
-      } catch (error) {
-        emit({
-          type: "item_error",
-          sourceUrl: item.sourceUrl,
-          message: error instanceof Error ? error.message : String(error),
-        });
-      }
+    } finally {
+      await closePageQuietly(detailPage);
     }
-  } finally {
-    await detailPage.close().catch(() => {});
   }
 
   emit({ type: "done", summary: { candidates: list.length, skipped, discovered: selectedCandidates.length, saved, downloaded } });

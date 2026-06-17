@@ -385,6 +385,21 @@ a {
   gap: 12px;
 }
 
+.settings-field {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.settings-field input {
+  width: 92px;
+}
+
+.settings-field small {
+  color: #64748b;
+}
+
 .hero h1,
 .section-head h2,
 .card h3 {

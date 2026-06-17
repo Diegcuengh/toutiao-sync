@@ -6,6 +6,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use scraper::{Html, Selector};
+use sha1::{Digest, Sha1};
 
 use crate::{
     error::AppError,
@@ -55,6 +56,7 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
           article_path TEXT,
           video_path TEXT,
           local_dir TEXT,
+          download_error TEXT,
           list_order INTEGER,
           list_run_id TEXT,
           raw_json TEXT NOT NULL DEFAULT '{}',
@@ -108,6 +110,7 @@ pub fn connect(db_path: &Path) -> Result<Connection, AppError> {
     ensure_column(&conn, "content_items", "cover_path", "TEXT")?;
     ensure_column(&conn, "content_items", "list_order", "INTEGER")?;
     ensure_column(&conn, "content_items", "list_run_id", "TEXT")?;
+    ensure_column(&conn, "content_items", "download_error", "TEXT")?;
     migrate_legacy_remote_ids(&conn)?;
     restore_downloaded_list_metadata(&conn)?;
     repair_downloaded_article_bodies(&conn)?;
@@ -443,6 +446,26 @@ fn restore_downloaded_list_metadata(conn: &Connection) -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+fn stable_local_id(remote_id: &str, source_url: &str, content_type: &str) -> String {
+    let raw_remote_id = remote_id.trim();
+    let canonical_id = if raw_remote_id
+        .split_once(':')
+        .map(|(kind, value)| matches!(kind, "article" | "video" | "w") && !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        raw_remote_id.to_string()
+    } else if let Some(value) = canonical_remote_id_from_url(source_url, content_type, raw_remote_id) {
+        value
+    } else if !raw_remote_id.is_empty() {
+        raw_remote_id.to_string()
+    } else {
+        normalized_remote_url(source_url).unwrap_or_else(|| source_url.trim().to_string())
+    };
+    let mut hasher = Sha1::new();
+    hasher.update(canonical_id.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn get_app_meta(conn: &Connection, key: &str) -> Result<Option<String>, AppError> {
@@ -890,6 +913,10 @@ pub fn upsert_item(conn: &Connection, source: &str, item: &ScriptItem, synced_at
           article_path = COALESCE(excluded.article_path, content_items.article_path),
           video_path = COALESCE(excluded.video_path, content_items.video_path),
           local_dir = COALESCE(excluded.local_dir, content_items.local_dir),
+          download_error = CASE
+            WHEN excluded.article_path IS NOT NULL OR excluded.video_path IS NOT NULL THEN NULL
+            ELSE content_items.download_error
+          END,
           list_order = COALESCE(excluded.list_order, content_items.list_order),
           list_run_id = COALESCE(excluded.list_run_id, content_items.list_run_id),
           raw_json = excluded.raw_json,
@@ -921,6 +948,27 @@ pub fn upsert_item(conn: &Connection, source: &str, item: &ScriptItem, synced_at
         |row| row.get::<_, i64>(0),
     )?;
     classify_item_by_id(conn, item_id)?;
+    Ok(())
+}
+
+pub fn mark_item_download_failed(
+    conn: &Connection,
+    source: &str,
+    source_url: &str,
+    message: &str,
+) -> Result<(), AppError> {
+    let normalized = normalized_remote_url(source_url).unwrap_or_else(|| source_url.to_string());
+    conn.execute(
+        r#"
+        UPDATE content_items
+        SET download_error = ?1
+        WHERE source = ?2
+          AND article_path IS NULL
+          AND video_path IS NULL
+          AND (source_url = ?3 OR source_url = ?4)
+        "#,
+        params![message, source, source_url, normalized],
+    )?;
     Ok(())
 }
 
@@ -963,7 +1011,12 @@ pub fn search_items_page(
 
     match download_status.map(str::trim).filter(|value| !value.is_empty()) {
         Some("downloaded") => where_sql.push_str(" AND (article_path IS NOT NULL OR video_path IS NOT NULL)"),
-        Some("pending") => where_sql.push_str(" AND (article_path IS NULL AND video_path IS NULL)"),
+        Some("pending") => where_sql.push_str(
+            " AND (article_path IS NULL AND video_path IS NULL AND (download_error IS NULL OR download_error = ''))",
+        ),
+        Some("failed") => where_sql.push_str(
+            " AND (article_path IS NULL AND video_path IS NULL AND download_error IS NOT NULL AND download_error <> '')",
+        ),
         _ => {}
     }
 
@@ -989,7 +1042,7 @@ pub fn search_items_page(
 
     let mut sql = format!(
         r#"
-        SELECT id, remote_id, source, title, summary, content_text, author, content_type, source_url, cover_url, cover_path, article_path, video_path, local_dir, list_order, synced_at, raw_json,
+        SELECT id, remote_id, source, title, summary, content_text, author, content_type, source_url, cover_url, cover_path, article_path, video_path, local_dir, list_order, synced_at, raw_json, download_error,
                CASE WHEN article_path IS NOT NULL OR video_path IS NOT NULL THEN 1 ELSE 0 END AS downloaded,
                COALESCE((
                  SELECT GROUP_CONCAT(tag, '||')
@@ -1036,9 +1089,10 @@ pub fn search_items_page(
             list_order: row.get(14)?,
             synced_at: row.get(15)?,
             raw_json: row.get(16)?,
-            downloaded: row.get::<_, i64>(17)? == 1,
+            download_error: row.get(17)?,
+            downloaded: row.get::<_, i64>(18)? == 1,
             tags: row
-                .get::<_, String>(18)?
+                .get::<_, String>(19)?
                 .split("||")
                 .map(str::trim)
                 .filter(|tag| !tag.is_empty())
@@ -1085,7 +1139,8 @@ pub fn list_tag_options(conn: &Connection, source: Option<&str>) -> Result<Vec<T
 
     for (name, condition) in [
         ("已下载", "(article_path IS NOT NULL OR video_path IS NOT NULL)"),
-        ("未下载", "(article_path IS NULL AND video_path IS NULL)"),
+        ("未下载", "(article_path IS NULL AND video_path IS NULL AND (download_error IS NULL OR download_error = ''))"),
+        ("下载失败", "(article_path IS NULL AND video_path IS NULL AND download_error IS NOT NULL AND download_error <> '')"),
     ] {
         let (source_sql, binds) = latest_source_filter_sql(source);
         let sql = format!("SELECT COUNT(*) FROM content_items WHERE 1 = 1 {source_sql} AND {condition}");
@@ -1181,15 +1236,40 @@ pub fn list_item_tags(conn: &Connection, item_id: i64) -> Result<Vec<String>, Ap
     Ok(tags)
 }
 
-pub fn get_item_dir(conn: &Connection, item_id: i64) -> Result<Option<String>, AppError> {
+pub fn get_or_create_item_dir(conn: &Connection, item_id: i64, download_dir: &Path) -> Result<Option<String>, AppError> {
     let value = conn
         .query_row(
-            "SELECT local_dir FROM content_items WHERE id = ?1",
+            "SELECT source, remote_id, source_url, content_type, local_dir FROM content_items WHERE id = ?1",
             [item_id],
-            |row| row.get::<_, Option<String>>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
         )
         .optional()?;
-    Ok(value.flatten())
+    let Some((source, remote_id, source_url, content_type, local_dir)) = value else {
+        return Ok(None);
+    };
+    if let Some(local_dir) = local_dir.filter(|value| !value.trim().is_empty()) {
+        fs::create_dir_all(&local_dir)?;
+        return Ok(Some(local_dir));
+    }
+
+    let local_dir = download_dir
+        .join(source)
+        .join(stable_local_id(&remote_id, &source_url, &content_type));
+    fs::create_dir_all(&local_dir)?;
+    let local_dir = local_dir.display().to_string();
+    conn.execute(
+        "UPDATE content_items SET local_dir = ?1 WHERE id = ?2 AND (local_dir IS NULL OR local_dir = '')",
+        params![&local_dir, item_id],
+    )?;
+    Ok(Some(local_dir))
 }
 
 pub fn get_item_file(conn: &Connection, item_id: i64, kind: &str) -> Result<Option<String>, AppError> {

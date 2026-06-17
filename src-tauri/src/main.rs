@@ -89,6 +89,7 @@ fn main() {
             commands::bootstrap_app,
             commands::choose_data_directory,
             commands::migrate_data_directory,
+            commands::set_download_threads,
             commands::launch_debug_chrome,
             commands::check_toutiao_login,
             commands::diagnose_page,

@@ -6,6 +6,7 @@ pub struct AppBootstrap {
     pub db_path: String,
     pub data_dir: String,
     pub download_dir: String,
+    pub download_threads: usize,
     pub active_session_ids: Vec<String>,
     pub version: String,
     pub build_date: String,
@@ -109,6 +110,7 @@ pub struct ContentItem {
     pub list_order: Option<i64>,
     pub synced_at: String,
     pub downloaded: bool,
+    pub download_error: Option<String>,
     pub raw_json: String,
     pub tags: Vec<String>,
 }
@@ -163,6 +165,7 @@ pub enum ScriptEvent {
         processed: Option<i64>,
         saved: Option<i64>,
         downloaded: Option<i64>,
+        transient: Option<bool>,
         #[serde(alias = "pageUrl")]
         page_url: Option<String>,
         #[serde(alias = "pageTitle")]
